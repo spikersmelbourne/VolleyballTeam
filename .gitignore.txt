@@ -1,0 +1,12 @@
+# macOS / editor
+.DS_Store
+__pycache__/
+*.pyc
+
+# venv local
+venv/
+.venv/
+
+# credenciais/arquivos gerados
+service_account.json
+token.json
