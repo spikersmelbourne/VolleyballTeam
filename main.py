@@ -1,48 +1,47 @@
 # main.py — FastAPI + Google Sheets + Minimal UI (Upload CSV + Generate Teams → opens /teams)
 from __future__ import annotations
 
-import base64, csv, io, os, re
+import csv, io, os
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime, date
 from collections import defaultdict
+import random
 
 from fastapi import FastAPI, UploadFile, File, Body
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
-from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from google.auth.transport.requests import Request
+from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 
 from algorithm import generate_teams  # <- pure logic module
-from google.oauth2.service_account import Credentials as ServiceAccountCredentials
-# ----------------------- Config -----------------------
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/spreadsheets",
-]
-GMAIL_QUERY = os.getenv("GMAIL_QUERY", 'has:attachment (filename:csv OR filename:txt) newer_than:14d')
 
+# ----------------------- Config -----------------------
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 SESSIONS_TAB = os.getenv("SESSIONS_TAB", "Sessions")
 ASSIGNMENTS_TAB = os.getenv("ASSIGNMENTS_TAB", "Assignments")
 
-VALID_POS = {"setter", "middle", "oppo", "outside"}
-
+# No UI changes: manter o mesmo conjunto de inputs/botões
 app = FastAPI(title="Volleyball Teams — CSV → Generate")
 
 STATE = {
-    "players": [],    # [{name, gender, pref1, pref2, pref3}]
-    "teams": [],      # [{team, players:[{name,pos,gender}]}]
+    "players": [],    # [{name, gender, email, pref1, pref2, pref3}]
+    "teams": [],      # [{team, size, missing, extra_player_index, players:[{name,email,gender,pos}]}]
     "source": "",
     "updated_at": None,
     "seed": None,
     "session_id": None,   # last generated session_id (DRAFT)
 }
 
+VALID_POS = {"setter", "middle", "oppo", "outside"}
+
+# ----------------- Helpers ---------------------------
 def _touch_state():
     STATE["updated_at"] = datetime.utcnow().isoformat() + "Z"
 
-# ----------------- Google API Helpers -----------------
+def _norm(s: Optional[str]) -> str:
+    return (s or "").strip().lower()
+
+# ----------------- Google API ------------------------
 def credentials():
     """
     Load service account credentials from the JSON key file.
@@ -59,115 +58,111 @@ def credentials():
 def sheets_service():
     if not GOOGLE_SHEET_ID:
         raise RuntimeError("Set GOOGLE_SHEET_ID in the environment.")
+    # cache_discovery=False evita warnings locais
     return build("sheets", "v4", credentials=credentials(), cache_discovery=False)
 
 # ----------------- CSV Parsing ------------------------
 def _normalize_pos(x: str) -> str:
-    v = (x or "").strip().lower()
-    if v not in VALID_POS:
-        return ""
+    v = _norm(x)
     if v == "oppo":
         return "outside"
-    return v
+    if v in {"setter", "middle", "outside"}:
+        return v
+    return ""  # inválido → vaza como vazio
 
 def parse_csv_bytes(b: bytes) -> List[Dict[str, str]]:
     text = b.decode("utf-8", errors="ignore")
     out: List[Dict[str, str]] = []
-    try:
-        reader = csv.DictReader(io.StringIO(text))
-        for row in reader:
-            row_ci = { (k or '').strip().lower(): (v or '').strip() for k,v in row.items() }
-            name   = row_ci.get("name") or row_ci.get("player") or row_ci.get("jogador")
-            gender = (row_ci.get("gender") or "").lower()
-            email  = row_ci.get("email") or row_ci.get("e-mail") or row_ci.get("mail") or ""
-            p1 = _normalize_pos(row_ci.get("pref1") or row_ci.get("y-preferred-position") or "")
-            p2 = _normalize_pos(row_ci.get("pref2") or "")
-            p3 = _normalize_pos(row_ci.get("pref3") or "")
-            if not name:
-                continue
-            if p1 and p1 == p2 == p3:
-                p2 = ""
-                p3 = ""
-            out.append({"name": name, "gender": gender,"email": email,"pref1": p1, "pref2": p2, "pref3": p3})
-    except Exception:
-        pass
-
-    # headerless fallback
-    if not out:
-        raw = list(csv.reader(io.StringIO(text)))
-        if raw:
-            hdr = [c.strip().lower() for c in raw[0]]
-            start = 1 if any(h in ('name','player','jogador') for h in hdr) else 0
-            for r in raw[start:]:
-                if not r: continue
-                nm = (r[0] or '').strip()
-                if nm:
-                    out.append({"name": nm, "gender": "", "pref1": "", "pref2": "", "pref3": ""})
+    reader = csv.DictReader(io.StringIO(text))
+    for row in reader:
+        row_ci = { (k or '').strip().lower(): (v or '').strip() for k,v in row.items() }
+        name   = row_ci.get("name") or row_ci.get("player") or row_ci.get("jogador")
+        email  = (row_ci.get("email") or row_ci.get("e-mail") or row_ci.get("mail") or "").strip().lower()
+        gender = (row_ci.get("gender") or "").lower()
+        p1 = _normalize_pos(row_ci.get("pref1") or row_ci.get("y-preferred-position") or "")
+        p2 = _normalize_pos(row_ci.get("pref2") or "")
+        p3 = _normalize_pos(row_ci.get("pref3") or "")
+        if not name or not email:
+            continue  # e-mail é obrigatório
+        # Se tudo igual, manter só pref1
+        if p1 and p1 == p2 == p3:
+            p2 = ""
+            p3 = ""
+        out.append({"name": name, "gender": gender, "email": email, "pref1": p1, "pref2": p2, "pref3": p3})
     return out
 
 # ----------------- Sheets I/O -------------------------
 def ensure_tabs_and_headers():
     svc = sheets_service()
     meta = svc.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
-    current = {s["properties"]["title"] for s in meta.get("sheets", [])}
-    requests = []
-    if SESSIONS_TAB not in current:
-        requests.append({"addSheet": {"properties": {"title": SESSIONS_TAB}}})
-    if ASSIGNMENTS_TAB not in current:
-        requests.append({"addSheet": {"properties": {"title": ASSIGNMENTS_TAB}}})
-    if not any(s.lower() == "history" for s in current):
-        requests.append({"addSheet": {"properties": {"title": "History"}}})
-    if requests:
-        svc.spreadsheets().batchUpdate(spreadsheetId=GOOGLE_SHEET_ID, body={"requests": requests}).execute()
 
-    # headers
-    def header_ok(tab: str, expected: List[str]) -> bool:
+    # normaliza títulos existentes
+    titles_raw = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    titles_norm = { (t or "").strip().lower() for t in titles_raw }
+
+    want_sessions = (SESSIONS_TAB or "Sessions").strip()
+    want_assign   = (ASSIGNMENTS_TAB or "Assignments").strip()
+    want_history  = "History"
+
+    need_sessions = want_sessions.strip().lower() not in titles_norm
+    need_assign   = want_assign.strip().lower()   not in titles_norm
+    need_history  = want_history.strip().lower()  not in titles_norm
+
+    requests = []
+    if need_sessions:
+        requests.append({"addSheet": {"properties": {"title": want_sessions}}})
+    if need_assign:
+        requests.append({"addSheet": {"properties": {"title": want_assign}}})
+    if need_history:
+        requests.append({"addSheet": {"properties": {"title": want_history}}})
+
+    if requests:
+        try:
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=GOOGLE_SHEET_ID,
+                body={"requests": requests}
+            ).execute()
+        except Exception as e:
+            # Se outro processo criou a aba no meio tempo ou há variação de nome,
+            # ignoramos erros de "already exists".
+            msg = str(e).lower()
+            if "already exists" not in msg:
+                raise
+
+    # ----- headers -----
+    def header_ok(tab: str, expected: list[str]) -> bool:
         res = svc.spreadsheets().values().get(
             spreadsheetId=GOOGLE_SHEET_ID, range=f"{tab}!A1:Z1"
         ).execute()
         vals = res.get("values", [])
         if not vals:
             return False
-        row = vals[0]
+        row = [c.strip() for c in vals[0]]
         return row[:len(expected)] == expected
 
-    if not header_ok(SESSIONS_TAB, ["session_id", "date", "status"]):
+    if not header_ok(want_sessions, ["session_id", "date", "status"]):
         svc.spreadsheets().values().update(
             spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"{SESSIONS_TAB}!A1:C1",
+            range=f"{want_sessions}!A1:C1",
             valueInputOption="RAW",
             body={"values": [["session_id", "date", "status"]]}
         ).execute()
 
-    if not header_ok(ASSIGNMENTS_TAB, ["session_id", "name", "pref1", "assigned_pos", "out_of_pref1"]):
+    if not header_ok(want_assign, ["session_id", "name", "email", "pref1", "assigned_pos", "out_of_pref1"]):
         svc.spreadsheets().values().update(
             spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"{ASSIGNMENTS_TAB}!A1:E1",
+            range=f"{want_assign}!A1:F1",
             valueInputOption="RAW",
-            body={"values": [["session_id", "name", "pref1", "assigned_pos", "out_of_pref1"]]}
+            body={"values": [["session_id", "name", "email", "pref1", "assigned_pos", "out_of_pref1"]]}
         ).execute()
 
-    if not header_ok("History", ["session_id", "name", "pref1", "assigned_pos", "out_of_pref1", "archived_at"]):
+    if not header_ok(want_history, ["date", "name", "email", "pref1", "assigned_pos", "archived_at"]):
         svc.spreadsheets().values().update(
             spreadsheetId=GOOGLE_SHEET_ID,
-            range="History!A1:F1",
+            range=f"{want_history}!A1:F1",
             valueInputOption="RAW",
-            body={"values": [["session_id", "name", "pref1", "assigned_pos", "out_of_pref1", "archived_at"]]}
+            body={"values": [["date", "name", "email", "pref1", "assigned_pos", "archived_at"]]}
         ).execute()
-
-def _read_sessions() -> List[List[str]]:
-    svc = sheets_service()
-    res = svc.spreadsheets().values().get(
-        spreadsheetId=GOOGLE_SHEET_ID, range=f"{SESSIONS_TAB}!A2:C"
-    ).execute()
-    return res.get("values", []) or []
-
-def _read_assignments() -> List[List[str]]:
-    svc = sheets_service()
-    res = svc.spreadsheets().values().get(
-        spreadsheetId=GOOGLE_SHEET_ID, range=f"{ASSIGNMENTS_TAB}!A2:E"
-    ).execute()
-    return res.get("values", []) or []
 
 def _append_sessions(rows: List[List[str]]):
     if not rows: return
@@ -185,92 +180,41 @@ def _append_assignments(rows: List[List[str]]):
     svc = sheets_service()
     svc.spreadsheets().values().append(
         spreadsheetId=GOOGLE_SHEET_ID,
-        range=f"{ASSIGNMENTS_TAB}!A:E",
+        range=f"{ASSIGNMENTS_TAB}!A:F",  # 6 colunas, alinhado ao header
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": rows}
     ).execute()
 
-def _final_sessions_sorted_desc() -> List[Tuple[str, str]]:
-    """
-    Return list of (session_id, date) for FINAL sessions sorted by date desc (YYYY-MM-DD).
-    """
-    sessions = _read_sessions()
-    finals: List[Tuple[str, str]] = []
-    for r in sessions:
-        sid = (r[0] if len(r) > 0 else "").strip()
-        d   = (r[1] if len(r) > 1 else "").strip()
-        st  = (r[2] if len(r) > 2 else "").strip().upper()
-        if sid and d and st == "FINAL":
-            finals.append((sid, d))
-    # sort desc by date
-    finals.sort(key=lambda t: t[1], reverse=True)
-    return finals
-
-def _last_two_offpref_maps() -> Tuple[Dict[str, int], Dict[str, bool]]:
-    """
-    Build fairness maps from the last two FINAL sessions:
-      - count map: name -> 0..2 (times off-pref across last two finals)
-      - any map:   name -> True/False (off-pref at least once across last two finals)
-    """
-    finals = _final_sessions_sorted_desc()
-    last_two_ids = [sid for (sid, _) in finals[:2]]
-    if not last_two_ids:
-        return {}, {}
-
-    assignments = _read_assignments()
-    count_map: Dict[str, int] = defaultdict(int)
-    any_map: Dict[str, bool] = defaultdict(bool)
-
-    for r in assignments:
-        if len(r) < 5: 
-            continue
-        sid, name, pref1, assigned_pos, out_flag = (r + ["", "", "", "", ""])[:5]
-        if sid not in last_two_ids:
-            continue
-        name = name.strip()
-        pref1 = (pref1 or "").strip().lower()
-        assigned_pos = (assigned_pos or "").strip().lower()
-        off = (pref1 and assigned_pos and pref1 != assigned_pos)
-        if off:
-            count_map[name] += 1
-            any_map[name] = True
-        else:
-            any_map.setdefault(name, any_map[name])
-
-    # clamp [0..2]
-    for k in list(count_map.keys()):
-        count_map[k] = min(2, max(0, count_map[k]))
-    return dict(count_map), dict(any_map)
-
-def _append_draft_session_with_assignments(session_id: str, session_date: str, teams: List[Dict], players_by_name: Dict[str, Dict]):
+def _append_draft_session_with_assignments(session_id: str, session_date: str, teams: List[Dict], players_by_email: Dict[str, Dict]):
     """
     Store a DRAFT session and its assignments.
-    - If same date already exists → clear Assignments before writing new data.
-    - If date changed → move previous off-pref players to History before clearing Assignments.
+    - Mesmo dia: limpa Assignments e grava nova geração.
+    - Mudou o dia: move off-pref do dia anterior para History (date-first), depois limpa Assignments.
+    - Retenção do History: 5 datas.
     """
     svc = sheets_service()
 
-    # Read current assignments
+    # Ler Assignments atuais
     res = svc.spreadsheets().values().get(
-        spreadsheetId=GOOGLE_SHEET_ID, range=f"{ASSIGNMENTS_TAB}!A2:E"
+        spreadsheetId=GOOGLE_SHEET_ID, range=f"{ASSIGNMENTS_TAB}!A2:F"
     ).execute()
     existing = res.get("values", []) or []
 
-    # Detect if previous session is same date
+    # Detectar data anterior pela session_id da primeira linha (prefixo YYYY-MM-DD)
     last_date = None
     if existing:
         first_sid = existing[0][0] if existing[0] else ""
         if first_sid and len(first_sid) >= 10:
-            last_date = first_sid[:10]  # YYYY-MM-DD from session_id
+            last_date = first_sid[:10]
 
-    # If different day → archive off-pref == "yes" to History
+    # Se mudou o dia → arquivar off-pref do dia anterior no History
     if last_date and last_date != session_date:
-        offpref_rows = [r for r in existing if len(r) >= 5 and r[4].strip().lower() == "yes"]
+        offpref_rows = [r for r in existing if len(r) >= 6 and (r[5] or "").strip().lower() == "yes"]
         if offpref_rows:
             archived_at = datetime.utcnow().isoformat() + "Z"
             body = {
-                "values": [r + [archived_at] for r in offpref_rows]
+                "values": [[last_date, r[1], r[2], r[3], r[4], archived_at] for r in offpref_rows]  # date,name,email,pref1,assigned_pos,archived_at
             }
             svc.spreadsheets().values().append(
                 spreadsheetId=GOOGLE_SHEET_ID,
@@ -280,94 +224,114 @@ def _append_draft_session_with_assignments(session_id: str, session_date: str, t
                 body=body
             ).execute()
 
-    # Clear assignments before writing new ones
+        # Retenção do History: manter só 5 datas
+        try:
+            hres = svc.spreadsheets().values().get(
+                spreadsheetId=GOOGLE_SHEET_ID, range="History!A2:F"
+            ).execute()
+            hrows = hres.get("values", []) or []
+            dates = []
+            for r in hrows:
+                if r and len(r) >= 1 and (r[0] or "").strip():
+                    dates.append((r[0].strip(), r))
+            distinct = sorted({d for d, _ in dates})
+            if len(distinct) > 5:
+                keep = set(sorted(distinct, reverse=True)[:5])  # 5 datas mais recentes
+                keep_rows = [r for r in hrows if r and (r[0] or "").strip() in keep]
+                svc.spreadsheets().values().clear(
+                    spreadsheetId=GOOGLE_SHEET_ID, range="History!A2:F"
+                ).execute()
+                if keep_rows:
+                    svc.spreadsheets().values().update(
+                        spreadsheetId=GOOGLE_SHEET_ID,
+                        range="History!A2",
+                        valueInputOption="RAW",
+                        body={"values": keep_rows}
+                    ).execute()
+        except Exception:
+            pass
+
+    # Limpar Assignments e regravar do zero
     svc.spreadsheets().values().clear(
-        spreadsheetId=GOOGLE_SHEET_ID, range=f"{ASSIGNMENTS_TAB}!A2:E"
+        spreadsheetId=GOOGLE_SHEET_ID, range=f"{ASSIGNMENTS_TAB}!A2:F"
     ).execute()
 
-    # Append new DRAFT session
+    # Adicionar linha de sessão (controle)
     _append_sessions([[session_id, session_date, "DRAFT"]])
 
-    # Build rows for new assignments
+    # Construir linhas para Assignments (com email)
     rows = []
     for t in teams:
         for p in t.get("players", []):
-            name = p["name"]
-            assigned = p["pos"]
-            pref1 = (players_by_name.get(name) or {}).get("pref1", "")
-            out_flag = "yes" if (pref1 and pref1.lower() != assigned.lower()) else "no"
-            rows.append([session_id, name, pref1, assigned, out_flag])
+            if p.get("is_missing"):
+                continue
+            name = p.get("name") or ""
+            email = (p.get("email") or "").strip().lower()
+            assigned = (p.get("pos") or "").strip().lower()
+            pref1 = (players_by_email.get(email) or {}).get("pref1", "")
+            out_flag = "yes" if (pref1 and assigned and pref1.lower() != assigned.lower()) else "no"
+            rows.append([session_id, name, email, pref1, assigned, out_flag])
 
-    # Write fresh assignments
     _append_assignments(rows)
-    # ------------------------------------------------------------------
-    # Retain only the last 6 sessions in Sessions and History
-    # ------------------------------------------------------------------
-    try:
-        # Read all sessions (after we just appended the new DRAFT row)
-        sess_res = svc.spreadsheets().values().get(
-            spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"{SESSIONS_TAB}!A2:C"
-        ).execute()
-        sessions_all = sess_res.get("values", []) or []
 
-        # Normalize rows: keep only valid [session_id, date, status]
-        norm = []
-        for r in sessions_all:
-            sid = (r[0] if len(r) > 0 else "").strip()
-            d   = (r[1] if len(r) > 1 else "").strip()
-            st  = (r[2] if len(r) > 2 else "").strip()
-            if sid and d:
-                norm.append([sid, d, st])
+def _last_two_offpref_maps_by_email_from_history() -> Tuple[Dict[str, int], Dict[str, bool]]:
+    """
+    Lê a aba History (date, name, email, pref1, assigned_pos, archived_at),
+    pega as DUAS últimas datas e computa:
+      - count_map: email_id -> 0..2
+      - any_map:   email_id -> True/False
+    """
+    svc = sheets_service()
+    res = svc.spreadsheets().values().get(
+        spreadsheetId=GOOGLE_SHEET_ID, range="History!A2:F"
+    ).execute()
+    rows = res.get("values", []) or []
 
-        # Sort by (date, session_id) ascending, then keep the last 6 (most recent)
-        norm.sort(key=lambda x: (x[1], x[0]))
-        keep = norm[-6:]
-        keep_ids = {row[0] for row in keep}
+    # Agrupar por data (coluna 0)
+    by_date: Dict[str, List[List[str]]] = defaultdict(list)
+    for r in rows:
+        if not r or len(r) < 5:
+            continue
+        date_str = (r[0] or "").strip()
+        if not date_str:
+            continue
+        by_date[date_str].append(r)
 
-        # If we had more than 6, rewrite Sessions and prune History
-        if len(norm) > 6:
-            # Rewrite Sessions (preserve header; replace A2:C with the kept 6)
-            svc.spreadsheets().values().clear(
-                spreadsheetId=GOOGLE_SHEET_ID,
-                range=f"{SESSIONS_TAB}!A2:C"
-            ).execute()
-            if keep:
-                svc.spreadsheets().values().update(
-                    spreadsheetId=GOOGLE_SHEET_ID,
-                    range=f"{SESSIONS_TAB}!A2",
-                    valueInputOption="RAW",
-                    body={"values": keep}
-                ).execute()
+    if not by_date:
+        return {}, {}
 
-            # Now prune History to only rows whose session_id is in keep_ids
-            hist_res = svc.spreadsheets().values().get(
-                spreadsheetId=GOOGLE_SHEET_ID,
-                range="History!A2:F"
-            ).execute()
-            history_all = hist_res.get("values", []) or []
+    # Datas em ordem desc
+    dates_sorted = sorted(by_date.keys(), reverse=True)
+    last_two = dates_sorted[:2]
 
-            history_keep = [r for r in history_all if (r and (r[0] in keep_ids))]
-            svc.spreadsheets().values().clear(
-                spreadsheetId=GOOGLE_SHEET_ID,
-                range="History!A2:F"
-            ).execute()
-            if history_keep:
-                svc.spreadsheets().values().update(
-                    spreadsheetId=GOOGLE_SHEET_ID,
-                    range="History!A2",
-                    valueInputOption="RAW",
-                    body={"values": history_keep}
-                ).execute()
-    except Exception:
-        # If anything goes wrong, do not block team generation.
-        pass
+    count_map: Dict[str, int] = defaultdict(int)
+    any_map: Dict[str, bool] = defaultdict(bool)
+
+    for d in last_two:
+        for r in by_date[d]:
+            # r: [date, name, email, pref1, assigned_pos, archived_at]
+            email = (r[2] if len(r) > 2 else "").strip().lower()
+            pref1 = (r[3] if len(r) > 3 else "").strip().lower()
+            assigned = (r[4] if len(r) > 4 else "").strip().lower()
+            if not email:
+                continue
+            off = (pref1 and assigned and pref1 != assigned)
+            if off:
+                count_map[email] += 1
+                any_map[email] = True
+            else:
+                any_map.setdefault(email, any_map[email])
+
+    for k in list(count_map.keys()):
+        count_map[k] = min(2, max(0, count_map[k]))
+    return dict(count_map), dict(any_map)
+
 # ----------------- Endpoints ---------------------------
 @app.post("/upload-csv")
 def upload_csv(file: UploadFile = File(...)):
     content = file.file.read()
     players = parse_csv_bytes(content)
-    players = [p for p in players if p.get("name")]
+    players = [p for p in players if p.get("name") and p.get("email")]
     if not players:
         return JSONResponse({"ok": False, "error": "No players parsed from CSV."}, status_code=422)
     STATE["players"] = players
@@ -380,10 +344,9 @@ def upload_csv(file: UploadFile = File(...)):
 def generate(payload: Optional[dict] = Body(default=None)):
     """
     Generate teams using current players list.
-    - Uses only FINAL sessions for fairness.
-    - Saves this generation as DRAFT (not counted in fairness until you later mark FINAL).
-    - Opens /teams on the client (frontend handles opening in new tab).
-    Body (optional): {"seed": 123, "session_date": "YYYY-MM-DD"}
+    Fairness: sempre baseado nas DUAS últimas datas do History (por e-mail).
+    Esta geração é gravada como DRAFT e substitui Assignments do dia corrente.
+    Body (opcional): {"seed": 123, "session_date": "YYYY-MM-DD"}
     """
     players = STATE.get("players", [])
     if not players:
@@ -407,27 +370,26 @@ def generate(payload: Optional[dict] = Body(default=None)):
             except Exception:
                 pass
 
-    # Build fairness maps from the last two FINAL sessions only
+    # Fairness maps das DUAS últimas datas em History (por e-mail)
     try:
-        last_two_count_map, last_two_any_map = _last_two_offpref_maps()
+        last_two_count_map, last_two_any_map = _last_two_offpref_maps_by_email_from_history()
     except Exception:
         last_two_count_map, last_two_any_map = {}, {}
 
-    # Generate
-    import random 
     teams = generate_teams(
         players,
-        seed=random.randint(1, 99999),
-        last_two_offpref_count_by_name=last_two_count_map,
-        last_two_any_offpref_by_name=last_two_any_map
+        seed=seed,
+        last_two_offpref_count_by_id=last_two_count_map,
+        last_two_any_offpref_by_id=last_two_any_map
     )
 
-    # Save as DRAFT (this generation does not affect fairness until you finalize it)
+    # Save como DRAFT
     session_id = f"{today.isoformat()}-{datetime.utcnow().strftime('%H%M%S')}"
-    players_by_name = {p["name"]: p for p in players}
+    players_by_email = {(p.get("email") or "").strip().lower(): p for p in players}
     try:
-        _append_draft_session_with_assignments(session_id, today.isoformat(), teams, players_by_name)
+        _append_draft_session_with_assignments(session_id, today.isoformat(), teams, players_by_email)
     except Exception:
+        # não quebra a geração se falhar escrita no Sheets
         pass
 
     STATE["teams"] = teams
@@ -443,13 +405,15 @@ def show_teams():
     if not teams:
         return "<p>No teams yet. Upload a CSV and click 'Generate Teams'.</p>"
 
-    # 1) mapear contagem por nome para detectar duplicados
-    name_counts = {}
+    # Contagem por nome para detectar homônimos
+    name_counts: Dict[str, int] = {}
     for t in teams:
         for p in t.get("players", []):
-            nm = p.get("name","")
+            if p.get("is_missing"):
+                continue
+            nm = p.get("name", "")
             name_counts[nm] = name_counts.get(nm, 0) + 1
-    dup_names = {n for n,c in name_counts.items() if c > 1}
+    dup_names = {n for n, c in name_counts.items() if c > 1}
 
     html = """
 <!doctype html>
@@ -462,10 +426,17 @@ def show_teams():
     .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap:16px; }
     .card { border:1px solid #ddd; border-radius:10px; padding:12px; }
     .title { font-size:18px; margin:0 0 8px 0; }
+    ul { padding-left:18px; margin:8px 0 0 0; }
     li { margin:4px 0; }
     .pos { font-weight:bold; }
     .info { font-size:14px; color:#555; margin-top:4px; }
     .missing { color:red; font-weight:bold; margin-top:4px; }
+    .extra { color:red; }
+    @media (prefers-color-scheme: dark) {
+      body { background:#111; color:#eee; }
+      .card { border-color:#333; }
+      .info { color:#aaa; }
+    }
   </style>
 </head>
 <body>
@@ -473,25 +444,37 @@ def show_teams():
   <div class="grid">
 """
     for t in teams:
-        count = len(t.get("players", []))
-        missing = t.get("missing")
+        # conta apenas jogadores reais (exclui placeholder)
+        real_count = sum(1 for p in t.get("players", []) if not p.get("is_missing"))
         html += f'<div class="card"><h3 class="title">Time {t.get("team")}</h3>'
-        html += f'<div class="info">Players: {count}</div>'
-        if missing:
-            html += f'<div class="missing">Missing – {missing}</div>'
+        html += f'<div class="info">Players: {real_count}</div>'
+        if t.get("missing") == "middle":
+            html += "<div class='missing'>Missing — middle</div>"
         html += "<ul>"
-        for p in t.get("players", []):
-            name = p.get("name","")
+
+        extra_idx = t.get("extra_player_index")
+        for idx, p in enumerate(t.get("players", [])):
+            if p.get("is_missing"):
+                # já mostramos “Missing — middle” acima, então pula aqui
+                continue
+            name = p.get("name", "")
             label = name
             if name in dup_names:
                 em = (p.get("email") or "").strip()
                 if em:
-                    # escapar os sinais < > no HTML
                     label = f'{name} &lt;{em}&gt;'
-            html += f"<li>{label} — <span class='pos'>{p.get('pos','')}</span></li>"
+            li_class = "extra" if (t.get("size") == 7 and idx == extra_idx) else ""
+            html += f"<li class='{li_class}'>{label} — <span class='pos'>{p.get('pos','')}</span></li>"
+
         html += "</ul></div>"
-    html += "</div></body></html>"
+
+    html += """
+  </div>
+</body>
+</html>
+"""
     return html
+
 @app.post("/reset")
 def reset_all():
     STATE["players"] = []
@@ -502,7 +485,7 @@ def reset_all():
     _touch_state()
     return {"ok": True, **STATE}
 
-# ----------------- Minimal Frontend --------------------
+# ----------------- Minimal Frontend (inalterado) --------------------
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
