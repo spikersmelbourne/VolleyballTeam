@@ -101,19 +101,29 @@ def _rank_for_slot(
     last_two_any_offpref_by_id: Dict[str, bool],
     relaxed: bool,
 ) -> Optional[Tuple[int, int, int]]:
-    """
-    Retorna (pref_rank, fairness_penalty, special_penalty) se elegível; None se inelegível.
-    - fairness é penalidade "suave": não bloqueia, prioriza quem foi menos off-pref nas 2 últimas datas.
-    - Em pass 1 (relaxed=False) aplicamos restrições mais rígidas:
-        * limitar F a 1 por time até distribuir em todos (se possível)
-        * bloquear all-outside cobrindo middle quando o jogador já foi off-pref nas 2 últimas
-    - Em pass 2 (relaxed=True) afrouxamos (quando inevitável).
-    Regras duras que NUNCA relaxamos:
-        * F só joga de middle se pref1 == middle.
+    """Return (pref_rank, fairness_penalty, special_penalty) if the player is eligible
+    for the given slot, or None if they cannot be used there.
+
+    - Hard rules:
+      * Female only plays middle if pref1 == "middle".
+    - Pass 1 (relaxed=False):
+      * Try to keep at most 1 F per team until all teams have one.
+      * Block the "all-outside" → middle conversion when the player was off-pref
+        in at least one of the last two FINAL sessions.
+    - Pass 2 (relaxed=True):
+      * Soften the gender distribution / fairness constraints when necessary.
+
+    Extra rules:
+    - Se o jogador tem (setter, setter, setter), ele ganha rank 0 no slot de setter.
+    - Se o jogador tem pelo menos 2 "outside", ele é melhor backfill para middle
+      (rank 4) do que um backfill genérico (rank 5).
     """
     email = _norm(player.get("email"))
     gender = _norm(player.get("gender"))
     p1, p2, p3 = _norm(player.get("pref1")), _norm(player.get("pref2")), _norm(player.get("pref3"))
+
+    outside_count = (1 if p1 == "outside" else 0) + (1 if p2 == "outside" else 0) + (1 if p3 == "outside" else 0)
+    all_setter = (p1, p2, p3) == ("setter", "setter", "setter")
 
     # Regra dura: F não joga middle a menos que pref1 == middle
     if pos == "middle" and gender == "f" and p1 != "middle":
@@ -124,7 +134,10 @@ def _rank_for_slot(
         return None
 
     # Preferência rank
-    if p1 == pos:
+    # Bônus: quem colocou as três preferências como setter é priorizado para setter.
+    if pos == "setter" and all_setter:
+        pref_rank = 0
+    elif p1 == pos:
         pref_rank = 1
     elif p2 == pos:
         pref_rank = 2
@@ -132,12 +145,18 @@ def _rank_for_slot(
         pref_rank = 3
     else:
         # Backfill / conversão de posição
-        # Caso especial: all-outside cobrindo middle
-        if pos == "middle" and (p1, p2, p3) == ("outside", "outside", "outside"):
-            # Em pass 1, só permitimos se NÃO foi off-pref nas duas últimas (fairness).
-            if not relaxed and last_two_any_offpref_by_id.get(email, False):
-                return None
-            pref_rank = 4
+        if pos == "middle":
+            # Caso especial clássico: all-outside cobrindo middle
+            if (p1, p2, p3) == ("outside", "outside", "outside"):
+                # Em pass 1, só permitimos se NÃO foi off-pref nas duas últimas (fairness).
+                if not relaxed and last_two_any_offpref_by_id.get(email, False):
+                    return None
+                pref_rank = 4
+            # Novo caso: pelo menos 2 preferências como outside/oppo
+            elif outside_count >= 2:
+                pref_rank = 4
+            else:
+                pref_rank = 5  # backfill genérico
         else:
             pref_rank = 5  # backfill genérico
 

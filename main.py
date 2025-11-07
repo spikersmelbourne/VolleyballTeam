@@ -63,32 +63,68 @@ def sheets_service():
 
 # ----------------- CSV Parsing ------------------------
 def _normalize_pos(x: str) -> str:
+    """Normalize position strings coming from the CSV/Form.
+
+    Accepts variations like:
+    - "Outside", "Oppo", "Outside/Oppo", "Outside hitter", etc → "outside"
+    - "Middle", "Middle blocker" → "middle"
+    - "Setter" → "setter"
+    Anything else becomes empty string (invalid position).
+    """
     v = _norm(x)
-    if v == "oppo":
+    if not v:
+        return ""
+    # Outside / opposite variants
+    if "outside" in v or "oppo" in v or "opposite" in v:
         return "outside"
-    if v in {"setter", "middle", "outside"}:
-        return v
-    return ""  # inválido → vaza como vazio
+    # Middle variants
+    if "middle" in v:
+        return "middle"
+    # Setter variants
+    if "setter" in v:
+        return "setter"
+    return ""
 
 def parse_csv_bytes(b: bytes) -> List[Dict[str, str]]:
     text = b.decode("utf-8", errors="ignore")
     out: List[Dict[str, str]] = []
     reader = csv.DictReader(io.StringIO(text))
+
     for row in reader:
-        row_ci = { (k or '').strip().lower(): (v or '').strip() for k,v in row.items() }
-        name   = row_ci.get("name") or row_ci.get("player") or row_ci.get("jogador")
-        email  = (row_ci.get("email") or row_ci.get("e-mail") or row_ci.get("mail") or "").strip().lower()
+        # normaliza cabeçalhos para minúsculo
+        row_ci = { (k or '').strip().lower(): (v or '').strip() for k, v in row.items() }
+
+        # Nome (mantém sua lógica atual)
+        name = row_ci.get("name") or row_ci.get("player") or row_ci.get("jogador")
+
+        # Email
+        email = (row_ci.get("email") or row_ci.get("e-mail") or row_ci.get("mail") or "").strip().lower()
+
+        # Gênero (se existir)
         gender = (row_ci.get("gender") or "").lower()
-        p1 = _normalize_pos(row_ci.get("pref1") or row_ci.get("y-preferred-position") or "")
-        p2 = _normalize_pos(row_ci.get("pref2") or "")
-        p3 = _normalize_pos(row_ci.get("pref3") or "")
+
+        # >>> AGORA BEM SIMPLES: usa só os três nomes padrão <<<
+        p1 = _normalize_pos(row_ci.get("y-preferred-position-1") or "")
+        p2 = _normalize_pos(row_ci.get("y-preferred-position-2") or "")
+        p3 = _normalize_pos(row_ci.get("y-preferred-position-3") or "")
+
         if not name or not email:
-            continue  # e-mail é obrigatório
-        # Se tudo igual, manter só pref1
+            continue  # mantém a regra: precisa de nome e e-mail
+
+        # se as três prefs forem iguais, zera p2/p3
         if p1 and p1 == p2 == p3:
             p2 = ""
             p3 = ""
-        out.append({"name": name, "gender": gender, "email": email, "pref1": p1, "pref2": p2, "pref3": p3})
+
+        out.append({
+            "name": name,
+            "gender": gender,
+            "email": email,
+            "pref1": p1,
+            "pref2": p2,
+            "pref3": p3,
+        })
+
     return out
 
 # ----------------- Sheets I/O -------------------------
