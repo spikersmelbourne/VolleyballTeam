@@ -695,7 +695,7 @@ async function generateTeams(){
   const ghUrl = `https://spikersmelbourne.github.io/volleyball-teams-pages/times/${datePart}.html`;
 
   // Abre direto a página estática
-  window.open(ghUrl, '_blank');
+  window.open(`${ghUrl}?v=${Date.now()}`, '_blank');
 }
 </script>
   </body>
