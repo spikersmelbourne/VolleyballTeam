@@ -671,12 +671,31 @@ async function generateTeams(){
   const btn = document.getElementById('btnGenerate');
   btn.classList.add('loading');
   btn.disabled = true;
-  const r = await fetch('/generate-teams', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({})});
+
+  const r = await fetch('/generate-teams', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({})
+  });
+
   const d = await r.json();
   btn.classList.remove('loading');
   btn.disabled = false;
-  if(!d.ok){ alert(d.error || 'Generate error'); return; }
-  window.open('/teams','_blank');
+
+  if(!d.ok){
+    alert(d.error || 'Generate error');
+    return;
+  }
+
+  // session_id vem assim: "2025-11-18-123456"
+  const sessionId = d.session_id || '';
+  const datePart = sessionId.substring(0, 10); // "2025-11-18"
+
+  // URL do GitHub Pages (pasta 'times')
+  const ghUrl = `https://spikersmelbourne.github.io/volleyball-teams-pages/times/${datePart}.html`;
+
+  // Abre direto a página estática
+  window.open(ghUrl, '_blank');
 }
 </script>
   </body>
