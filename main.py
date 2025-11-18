@@ -691,11 +691,11 @@ async function generateTeams(){
   const sessionId = d.session_id || '';
   const datePart = sessionId.substring(0, 10); // "2025-11-18"
 
-  // URL RAW do GitHub (pega o arquivo direto do repo, sem passar pelo GitHub Pages)
-  const ghUrl = `https://raw.githubusercontent.com/spikersmelbourne/volleyball-teams-pages/main/times/${datePart}.html`;
+  // URL do GitHub Pages (pasta 'times')
+const ghUrl = `https://spikersmelbourne.github.io/volleyball-teams-pages/times/${datePart}.html`;
 
-// Abre direto a página estática mais recente, com quebra de cache
-  window.open(`${ghUrl}?v=${Date.now()}`, '_blank');
+// Abre direto a página estática
+window.open(`${ghUrl}?v=${Date.now()}`, '_blank');
 }
 </script>
   </body>
