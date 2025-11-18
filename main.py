@@ -692,10 +692,10 @@ async function generateTeams(){
   const datePart = sessionId.substring(0, 10); // "2025-11-18"
 
   // URL do GitHub Pages (pasta 'times')
-const ghUrl = `https://spikersmelbourne.github.io/volleyball-teams-pages/times/${datePart}.html`;
+  const ghUrl = `https://spikersmelbourne.github.io/volleyball-teams-pages/times/${datePart}.html`;
 
-// Abre direto a página estática
-window.open(`${ghUrl}?v=${Date.now()}`, '_blank');
+  // Abre direto a página sem cache
+  window.open(`${ghUrl}?v=${Date.now()}`, '_blank');
 }
 </script>
   </body>
