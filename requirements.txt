@@ -7,3 +7,4 @@ python-multipart
 pandas
 google-auth-httplib2
 python-multipart
+requests

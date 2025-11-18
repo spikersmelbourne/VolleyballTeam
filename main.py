@@ -1,11 +1,16 @@
 # main.py — FastAPI + Google Sheets + Minimal UI (Upload CSV + Generate Teams → opens /teams)
 from __future__ import annotations
 
+
 import csv, io, os
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime, date
 from collections import defaultdict
 import random
+import base64
+import json
+
+import requests
 
 from fastapi import FastAPI, UploadFile, File, Body
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -433,14 +438,21 @@ def generate(payload: Optional[dict] = Body(default=None)):
     STATE["session_id"] = session_id
     _touch_state()
 
+    # 🔹 gera HTML estático e manda pro GitHub Pages
+    try:
+        html_snapshot = build_teams_html(teams)
+        # usa a data da sessão (today) no formato YYYY-MM-DD
+        date_str = today.isoformat()
+        push_snapshot_to_github(html_snapshot, date_str)
+    except Exception:
+        # se falhar, não interrompe a geração dos times
+        pass
+
     return {"ok": True, "session_id": session_id, "teams": teams, "updated_at": STATE["updated_at"]}
-
-@app.get("/teams", response_class=HTMLResponse)
-def show_teams():
-    teams = STATE.get("teams", [])
-    if not teams:
-        return "<p>No teams yet. Upload a CSV and click 'Generate Teams'.</p>"
-
+def build_teams_html(teams: List[Dict]) -> str:
+    """Build the static HTML for the teams page.
+    Used both for /teams and for GitHub snapshots.
+    """
     # Contagem por nome para detectar homônimos
     name_counts: Dict[str, int] = {}
     for t in teams:
@@ -459,6 +471,7 @@ def show_teams():
   <title>Teams</title>
   <style>
     body { font-family: system-ui, Arial; margin:0; padding:16px; }
+    h2 { margin-top: 0; }
     .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap:16px; }
     .card { border:1px solid #ddd; border-radius:10px; padding:12px; }
     .title { font-size:18px; margin:0 0 8px 0; }
@@ -480,7 +493,6 @@ def show_teams():
   <div class="grid">
 """
     for t in teams:
-        # conta apenas jogadores reais (exclui placeholder)
         real_count = sum(1 for p in t.get("players", []) if not p.get("is_missing"))
         html += f'<div class="card"><h3 class="title">Time {t.get("team")}</h3>'
         html += f'<div class="info">Players: {real_count}</div>'
@@ -491,7 +503,6 @@ def show_teams():
         extra_idx = t.get("extra_player_index")
         for idx, p in enumerate(t.get("players", [])):
             if p.get("is_missing"):
-                # já mostramos “Missing — middle” acima, então pula aqui
                 continue
             name = p.get("name", "")
             label = name
@@ -511,6 +522,68 @@ def show_teams():
 """
     return html
 
+
+def push_snapshot_to_github(html: str, date_str: str) -> None:
+    """
+    Push a static HTML snapshot for the given date to the GitHub Pages repo.
+    - date_str: 'YYYY-MM-DD'
+    O arquivo será salvo em: {GH_BASE_PATH}/{date_str}.html
+    """
+
+    gh_token = os.getenv("GH_TOKEN", "").strip()
+    gh_repo = os.getenv("GH_REPO", "").strip()
+    gh_branch = os.getenv("GH_BRANCH", "main").strip()
+    base_path = os.getenv("GH_BASE_PATH", "times").strip()
+
+    if not gh_token or not gh_repo:
+        # Se não estiver configurado, não quebra a geração
+        return
+
+    owner_repo = gh_repo  # formato 'user/repo'
+    filename = f"{date_str}.html"
+    path = f"{base_path}/{filename}"
+
+    api_url = f"https://api.github.com/repos/{owner_repo}/contents/{path}"
+
+    # Conteúdo em base64
+    content_b64 = base64.b64encode(html.encode("utf-8")).decode("ascii")
+
+    headers = {
+        "Authorization": f"Bearer {gh_token}",
+        "Accept": "application/vnd.github+json",
+    }
+
+    # Descobrir SHA se o arquivo já existir (para update)
+    sha = None
+    try:
+        get_resp = requests.get(api_url, headers=headers, params={"ref": gh_branch})
+        if get_resp.status_code == 200:
+            data = get_resp.json()
+            sha = data.get("sha")
+    except Exception:
+        sha = None
+
+    body = {
+        "message": f"Update teams page for {date_str}",
+        "content": content_b64,
+        "branch": gh_branch,
+    }
+    if sha:
+        body["sha"] = sha  # update
+
+    try:
+        requests.put(api_url, headers=headers, data=json.dumps(body))
+    except Exception:
+        # Se der erro, só não publica, mas não quebra o algoritmo
+        pass
+
+@app.get("/teams", response_class=HTMLResponse)
+def show_teams():
+    teams = STATE.get("teams", [])
+    if not teams:
+        return "<p>No teams yet. Upload a CSV and click 'Generate Teams'.</p>"
+    html = build_teams_html(teams)
+    return html
 @app.post("/reset")
 def reset_all():
     STATE["players"] = []
