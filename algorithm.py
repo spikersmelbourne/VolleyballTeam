@@ -103,39 +103,67 @@ def _rank_for_slot(
     """Return (pref_rank, fairness_penalty, special_penalty) if the player is eligible
     for the given slot, or None if they cannot be used there.
 
-    - Hard rules:
-      * Female only plays middle if pref1 == "middle".
-    - Pass 1 (relaxed=False):
-      * Try to keep at most 1 F per team until all teams have one.
-      * Block the "all-outside" → middle conversion when the player was off-pref
-        in at least one of the last two FINAL sessions.
-      * NEW: Avoid pulling players with pref1=middle into setter unless setter is pref2.
-    - Pass 2 (relaxed=True):
-      * Soften the gender distribution / fairness constraints when necessary.
+    Regras principais:
+      - F só joga middle se pref1 == "middle".
+      - Fairness é baseado em quantas vezes a pessoa jogou fora da pref1
+        nas duas últimas datas (off-pref), independente da posição.
     """
 
     email = _norm(player.get("email"))
     gender = _norm(player.get("gender"))
     p1, p2, p3 = _norm(player.get("pref1")), _norm(player.get("pref2")), _norm(player.get("pref3"))
 
-    outside_count = (1 if p1 == "outside" else 0) + (1 if p2 == "outside" else 0) + (1 if p3 == "outside" else 0)
+    # Quantas vezes essa pessoa já foi off-pref nas duas últimas datas
+    off_ct = last_two_offpref_count_by_id.get(email, 0)
+
     all_setter = (p1, p2, p3) == ("setter", "setter", "setter")
 
-    # 🚫 NEW RULE: avoid using players with pref1=middle as setter unless setter is pref2.
-    # Example: John (middle/outside/setter) should not be used as setter
-    # while players like Charles (outside/setter/...) are still available.
-    if pos == "setter" and not relaxed and p1 == "middle" and p2 != "setter":
-        return None
+    # ---------------------------------------------------
+    #  BLOCO ESPECÍFICO PARA MIDDLE (onde entra o sacrifício)
+    # ---------------------------------------------------
+    if pos == "middle":
+        # 1) F só joga middle se pref1 == "middle"
+        if gender == "f" and p1 != "middle":
+            return None
 
-    # Hard rule: F cannot play middle unless pref1 == middle
-    if pos == "middle" and gender == "f" and p1 != "middle":
-        return None
+        # 2) Se já foi off-pref nas DUAS últimas datas, não sacrificar de novo
+        if not relaxed and off_ct >= 2:
+            return None
 
-    # Try to keep at most one female per team until distribution is complete
+        # 3) Verdadeiros middles têm prioridade
+        if p1 == "middle":
+            pref_rank = 1
+            going_off = False
+        else:
+            # 4) BACKFILL: qualquer outro jogador elegível tem a MESMA prioridade
+            #    (não importa o que colocou em pref2/pref3)
+            pref_rank = 4
+            going_off = True  # está indo fora da pref1
+
+        # 5) Fairness penalty: maior para quem já foi off-pref antes
+        fairness_penalty = 0
+        if going_off:
+            fairness_penalty += off_ct * 2
+            if off_ct >= 1 and not relaxed:
+                fairness_penalty += 3
+
+        special_penalty = 0
+        return (pref_rank, fairness_penalty, special_penalty)
+
+    # ---------------------------------------------------
+    #  OUTRAS POSIÇÕES (setter / outside / oppo)
+    # ---------------------------------------------------
+
+    # Distribuição de F: tenta manter no máx. 1 F por time até todos terem uma
     if not relaxed and gender == "f" and team_has_f_already and not distributed_f:
         return None
 
-    # Preference rank (1 = best)
+    # Regra de setter: evitar usar quem é "middle" de pref1 como setter,
+    # a menos que setter esteja em pref2.
+    if pos == "setter" and not relaxed and p1 == "middle" and p2 != "setter":
+        return None
+
+    # Ranking de preferência (1 = melhor)
     if pos == "setter" and all_setter:
         pref_rank = 0
     elif p1 == pos:
@@ -145,29 +173,17 @@ def _rank_for_slot(
     elif p3 == pos:
         pref_rank = 3
     else:
-        # Backfill logic (outside covering middle, etc.)
-        if pos == "middle":
-            if (p1, p2, p3) == ("outside", "outside", "outside"):
-                if not relaxed and last_two_any_offpref_by_id.get(email, False):
-                    return None
-                pref_rank = 4
-            elif outside_count >= 2:
-                pref_rank = 4
-            else:
-                pref_rank = 5
-        else:
-            pref_rank = 5
+        pref_rank = 5
 
-    # Fairness penalty (soft)
+    # Fairness: penaliza quem vai jogar fora de pref1
     going_off = (pos != p1)
-    off_ct = last_two_offpref_count_by_id.get(email, 0)
     fairness_penalty = 0
     if going_off:
         fairness_penalty += off_ct * 2
         if not relaxed and off_ct >= 1:
             fairness_penalty += 3
 
-    # Light penalty for middle→setter conversion
+    # Penalidade leve para conversão middle → setter (quando permitido)
     special_penalty = 1 if (pos == "setter" and p1 == "middle" and p2 == "setter") else 0
 
     return (pref_rank, fairness_penalty, special_penalty)
