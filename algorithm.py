@@ -6,7 +6,7 @@ VALID_POS = {"setter", "middle", "outside"}
 
 class HistoryFairness:
     """
-    Encapsula a informao de fairness das duas ltimas datas.
+    Encapsula a informação de fairness das duas últimas datas.
     """
     def __init__(
         self,
@@ -17,23 +17,23 @@ class HistoryFairness:
         self.any_offpref_by_id = any_offpref_by_id or {}
 
     def offpref_count(self, email: str) -> int:
-        """Quantas vezes o jogador foi off-pref nas duas ltimas datas (0..2)."""
+        """Quantas vezes o jogador foi off-pref nas duas últimas datas (0..2)."""
         return self.offpref_count_by_id.get(email, 0)
 
     def has_any_offpref(self, email: str) -> bool:
-        """Se o jogador j foi off-pref pelo menos uma vez nas duas ltimas datas."""
+        """Se o jogador já foi off-pref pelo menos uma vez nas duas últimas datas."""
         return self.any_offpref_by_id.get(email, False)
 
 class TemplatePlanner:
     """
-    Responsvel por decidir quantos times e a estrutura 7/6/5.
+    Responsável por decidir quantos times e a estrutura 7/6/5.
     """
 
     @staticmethod
     def plan(n_players: int) -> Tuple[int, List[List[str]]]:
         """
         - r=0: T times de 6
-        - r=1,2: floor(N/6) times de 6 e r times de 7   total = floor + r (ordem: 7,7,... depois 6)
+        - r=1,2: floor(N/6) times de 6 e r times de 7  → total = floor + r (ordem: 7,7,... depois 6)
         - r=3: ceil times; 3 de 5
         - r=4: ceil times; 2 de 5
         - r=5: ceil times; 1 de 5
@@ -46,7 +46,7 @@ class TemplatePlanner:
 
         if r in (1, 2):
             base = n_players // 6
-            T = base   # mantemos esse comportamento idntico ao antigo
+            T = base   # mantemos esse comportamento idêntico ao antigo
             templates_7 = [
                 ["setter", "middle", "middle", "outside", "outside", "outside", "outside"]
                 for _ in range(r)
@@ -58,10 +58,10 @@ class TemplatePlanner:
             templates = templates_7 + templates_6   # 7 primeiro, depois 6
             return T, templates
 
-        # r in (3, 4, 5)  alguns times de 5 (falta 1 middle)
+        # r in (3, 4, 5) → alguns times de 5 (falta 1 middle)
         T = (n_players + 5) // 6  # ceil
         five = {3: 3, 4: 2, 5: 1}[r]
-        # ordem: 6 primeiro, depois 5 (para que 5 sejam os ltimos)
+        # ordem: 6 primeiro, depois 5 (para que 5 sejam os últimos)
         templates_6 = [
             ["setter", "middle", "middle", "outside", "outside", "outside"]
             for _ in range(T - five)
@@ -75,8 +75,8 @@ class TemplatePlanner:
 
 class SlotRanker:
     """
-    Responsvel por decidir o ranking de um jogador para um slot especfico.
-    Usa o histrico de fairness via HistoryFairness
+    Responsável por decidir o ranking de um jogador para um slot específico.
+    Usa o histórico de fairness via HistoryFairness
     e a lista de jogadores protegidos (keep pref1).
     """
 
@@ -104,18 +104,18 @@ class SlotRanker:
         p2 = self._norm(player.get("pref2"))
         p3 = self._norm(player.get("pref3"))
 
-        # Jogador "protegido": marcado na pgina de controle
-        # (via regra de cannot_play_positions  interpretada como keep pref1)
+        # Jogador "protegido": marcado na página de controle
+        # (via regra de cannot_play_positions → interpretada como keep pref1)
         protected = (email in self.keep_pref_emails) and (p1 in VALID_POS)
 
         # Regra principal do keep pref1:
-        # se  protegido, NO usar esse jogador fora da pref1
-        # na fase normal (relaxed=False). S considerar fora da pref1
-        # em modo relaxado, quando no h mais alternativas.
+        # se é protegido, NÃO usar esse jogador fora da pref1
+        # na fase normal (relaxed=False). Só considerar fora da pref1
+        # em modo relaxado, quando não há mais alternativas.
         if protected and not relaxed and pos != p1:
             return None
 
-        # Quantas vezes essa pessoa j foi off-pref nas duas ltimas datas
+        # Quantas vezes essa pessoa já foi off-pref nas duas últimas datas
         off_ct = self.history.offpref_count(email)
 
         all_setter = (p1, p2, p3) == ("setter", "setter", "setter")
@@ -177,18 +177,18 @@ class SlotRanker:
             special_penalty = 0
             return (pref_rank, fairness_penalty, special_penalty)
 
-        # ---------- OUTRAS POSIES (setter / outside) ----------
+        # ---------- OUTRAS POSIÇÕES (setter / outside) ----------
 
-        # Distribuio de F: tenta manter no mx. 1 F por time at todos terem uma
+        # Distribuição de F: tenta manter no máx. 1 F por time até todos terem uma
         if not relaxed and gender == "f" and team_has_f_already and not distributed_f:
             return None
 
-        # Regra de setter: evitar usar quem  "middle" de pref1 como setter,
+        # Regra de setter: evitar usar quem é "middle" de pref1 como setter,
         # a menos que setter esteja em pref2.
         if pos == "setter" and not relaxed and p1 == "middle" and p2 != "setter":
             return None
 
-        # Ranking de preferncia (1 = melhor)
+        # Ranking de preferência (1 = melhor)
         if pos == "setter" and all_setter:
             pref_rank = 0
         elif p1 == pos:
@@ -208,11 +208,10 @@ class SlotRanker:
             if not relaxed and off_ct >= 1:
                 fairness_penalty += 3
 
-        # Penalidade leve para converso middle  setter (quando permitido)
+        # Penalidade leve para conversão middle → setter (quando permitido)
         special_penalty = 1 if (pos == "setter" and p1 == "middle" and p2 == "setter") else 0
 
         return (pref_rank, fairness_penalty, special_penalty)
-
 
 class TeamGenerator:
     def __init__(
@@ -240,6 +239,7 @@ class TeamGenerator:
         if self.seed is not None:
             random.seed(self.seed)
         random.shuffle(self.players)
+
 
 class TeamGenerator:
     def __init__(
@@ -414,9 +414,9 @@ def postprocess_teams(
     last_two_any_offpref_by_id: Optional[Dict[str, bool]] = None,
 ) -> List[Dict]:
     """
-    Aplica regras suaves (soft control) DEPOIS da gerao principal dos times.
+    Aplica regras suaves (soft control) DEPOIS da geração principal dos times.
 
-    Regras vm do Google Sheets, no formato:
+    Regras vêm do Google Sheets, no formato:
       {
         "player_email": "a@x.com",
         "cannot_play_positions": ["middle", ...],
@@ -425,11 +425,11 @@ def postprocess_teams(
       }
 
     Comportamento (best-effort):
-      1) Tenta corrigir cannot_play_positions com trocas de posio dentro do mesmo time.
-      2) Tenta atender must_play_with trocando jogadores entre times (mesma posio).
-      3) Tenta separar cannot_play_with trocando jogadores entre times (mesma posio).
+      1) Tenta corrigir cannot_play_positions com trocas de posição dentro do mesmo time.
+      2) Tenta atender must_play_with trocando jogadores entre times (mesma posição).
+      3) Tenta separar cannot_play_with trocando jogadores entre times (mesma posição).
 
-    Se no achar swap seguro, ignora aquela regra e segue.
+    Se não achar swap seguro, ignora aquela regra e segue.
     """
     if not teams:
         return teams
@@ -468,11 +468,11 @@ def postprocess_teams(
             if e2:
                 entry["cannot_play_with"].add(e2)
 
-    # Se no h regras, nada a fazer.
+    # Se não há regras, nada a fazer.
     if not rules_by_email:
         return teams
 
-    # -------- Helper: ndice email -> (team_idx, player_idx) --------
+    # -------- Helper: índice email -> (team_idx, player_idx) --------
     def build_index() -> Dict[str, Tuple[int, int]]:
         idx: Dict[str, Tuple[int, int]] = {}
         for ti, team in enumerate(teams):
@@ -487,7 +487,7 @@ def postprocess_teams(
     email_index = build_index()
 
     # ===============================================================
-    # 1) cannot_play_positions  trocas de posio dentro do time
+    # 1) cannot_play_positions → trocas de posição dentro do time
     # ===============================================================
     for email, rule in rules_by_email.items():
         forbidden = rule["cannot_play_positions"]
@@ -496,19 +496,19 @@ def postprocess_teams(
 
         loc = email_index.get(email)
         if not loc:
-            continue  # jogador no est em nenhum time (no achou no CSV ou no foi escalado)
+            continue  # jogador não está em nenhum time (não achou no CSV ou não foi escalado)
 
         ti, pi = loc
         player = teams[ti]["players"][pi]
         current_pos = (player.get("pos") or "").strip().lower()
         if current_pos not in forbidden:
-            continue  # j est numa posio permitida
+            continue  # já está numa posição permitida
 
-        # Vamos tentar trocar de posio com algum do MESMO time:
-        #   - que tenha outra posio
-        #   - que no tenha o current_pos proibido
-        #   - preferindo quem tem histrico de off-pref menor
-        #   - se a posio for "middle", tentar evitar colocar F em middle se houver alternativa
+        # Vamos tentar trocar de posição com alguém do MESMO time:
+        #   - que tenha outra posição
+        #   - que não tenha o current_pos proibido
+        #   - preferindo quem tem histórico de off-pref menor
+        #   - se a posição for "middle", tentar evitar colocar F em middle se houver alternativa
         candidates = []
         for cj, cp in enumerate(teams[ti].get("players", [])):
             if cj == pi:
@@ -518,47 +518,47 @@ def postprocess_teams(
 
             other_pos = (cp.get("pos") or "").strip().lower()
             if other_pos == current_pos:
-                # trocar "middle" com "middle" no resolve o problema
+                # trocar "middle" com "middle" não resolve o problema
                 continue
 
             c_email = _norm_email(cp.get("email"))
             c_rule = rules_by_email.get(c_email)
             if c_rule and current_pos in c_rule["cannot_play_positions"]:
-                # o colega tambm no pode jogar nessa posio
+                # o colega também não pode jogar nessa posição
                 continue
 
-            # Fairness: evitar quem j foi muito sacrificado
+            # Fairness: evitar quem já foi muito sacrificado
             c_off = offpref_count.get(c_email, 0)
 
             c_gender = (cp.get("gender") or "").strip().lower()
             candidates.append((cj, c_off, c_gender, other_pos))
 
         if not candidates:
-            # no h ningum vivel para troca dentro do time
+            # não há ninguém viável para troca dentro do time
             continue
 
         # Escolher melhor candidato
         if current_pos == "middle":
-            # Preferir no-feminino, depois menor off-pref
+            # Preferir não-feminino, depois menor off-pref
             candidates.sort(key=lambda t: (1 if t[2] == "f" else 0, t[1]))
         else:
-            # S minimizar off-pref
+            # Só minimizar off-pref
             candidates.sort(key=lambda t: t[1])
 
         best_idx, _, _, _ = candidates[0]
         teammate = teams[ti]["players"][best_idx]
 
-        # Troca apenas as POSIES, mantendo os jogadores no mesmo time
+        # Troca apenas as POSIÇÕES, mantendo os jogadores no mesmo time
         player_pos_before = player.get("pos")
         teammate_pos_before = teammate.get("pos")
         player["pos"], teammate["pos"] = teammate_pos_before, player_pos_before
-        # ndices continuam corretos (mesmo team, mesmo ndice)
+        # índices continuam corretos (mesmo team, mesmo índice)
 
-    # Recria ndice aps as mudanas de posio
+    # Recria índice após as mudanças de posição
     email_index = build_index()
 
     # ===============================================================
-    # 2) must_play_with  trocas entre times (mesma posio)
+    # 2) must_play_with → trocas entre times (mesma posição)
     # ===============================================================
     for email, rule in rules_by_email.items():
         must_with = rule["must_play_with"]
@@ -579,19 +579,19 @@ def postprocess_teams(
             team_b_idx, player_b_idx = loc_b
 
             if team_a_idx == team_b_idx:
-                # j esto juntos
+                # já estão juntos
                 continue
 
             player_b = teams[team_b_idx]["players"][player_b_idx]
             b_pos = (player_b.get("pos") or "").strip().lower()
 
-            # Tentar trazer B para o time A, trocando com algum de MESMA posio
+            # Tentar trazer B para o time A, trocando com alguém de MESMA posição
             candidates = []
             for cj, cp in enumerate(teams[team_a_idx].get("players", [])):
                 if cp.get("is_missing"):
                     continue
                 if cj == player_a_idx:
-                    # aqui evitamos mexer no prprio A
+                    # aqui evitamos mexer no próprio A
                     continue
                 if (cp.get("pos") or "").strip().lower() != b_pos:
                     continue
@@ -601,23 +601,23 @@ def postprocess_teams(
                 candidates.append((cj, c_off))
 
             if not candidates:
-                # no achou ningum no time A com mesma posio para trocar
+                # não achou ninguém no time A com mesma posição para trocar
                 continue
 
             candidates.sort(key=lambda t: t[1])
             swap_idx, _ = candidates[0]
 
-            # Faz swap entre times: B <-> jogador de mesma posio do time A
+            # Faz swap entre times: B <-> jogador de mesma posição do time A
             teams[team_a_idx]["players"][swap_idx], teams[team_b_idx]["players"][player_b_idx] = (
                 teams[team_b_idx]["players"][player_b_idx],
                 teams[team_a_idx]["players"][swap_idx],
             )
 
-            # Recria ndice pois times mudaram
+            # Recria índice pois times mudaram
             email_index = build_index()
 
     # ===============================================================
-    # 3) cannot_play_with  separar pares via swap entre times
+    # 3) cannot_play_with → separar pares via swap entre times
     # ===============================================================
     for email, rule in rules_by_email.items():
         cannot_with = rule["cannot_play_with"]
@@ -638,10 +638,10 @@ def postprocess_teams(
             team_b_idx, player_b_idx = loc_b
 
             if team_a_idx != team_b_idx:
-                # j esto separados
+                # já estão separados
                 continue
 
-            # Tentamos mover B para outro time, trocando com algum da MESMA posio
+            # Tentamos mover B para outro time, trocando com alguém da MESMA posição
             player_b = teams[team_b_idx]["players"][player_b_idx]
             b_pos = (player_b.get("pos") or "").strip().lower()
 
@@ -677,6 +677,6 @@ def postprocess_teams(
                 email_index = build_index()
                 break  # para no primeiro swap que der certo
 
-            # se no conseguiu mover B para lugar nenhum, deixa como est
+            # se não conseguiu mover B para lugar nenhum, deixa como está
 
     return teams

@@ -125,6 +125,35 @@ def build_teams_html(teams: List[Dict]) -> str:
 """
     return html
 
+@app.get("/sessions/{session_date}/teams", response_class=HTMLResponse)
+def show_teams_for_session_date(session_date: str):
+    """
+    Render teams for a given session_date (YYYY-MM-DD),
+    reading them back from the Google Sheets Assignments tab.
+
+    This does NOT regenerate teams; it only displays what was saved.
+    """
+    try:
+        # garante tabs e headers
+        sheets_repo.ensure_tabs_and_headers()
+        # função nova que criamos no SheetsRepository
+        teams = sheets_repo.get_teams_for_session(session_date)
+    except Exception as e:
+        return HTMLResponse(
+            f"<p>Error loading teams for {session_date}: {e}</p>",
+            status_code=500,
+        )
+
+    if not teams:
+        return HTMLResponse(
+            f"<p>No teams found for {session_date}. Generate and save teams first.</p>",
+            status_code=404,
+        )
+
+    html = build_teams_html(teams)
+    return html
+
+
 
 def push_snapshot_to_github(html: str, date_str: str) -> None:
     """
@@ -514,8 +543,10 @@ async function generateTeams(){
   const sessionId = d.session_id || '';
   const datePart = sessionId.substring(0, 10); // "2025-11-18"
 
-  const ghUrl = `https://spikersmelbourne.github.io/volleyball-teams-pages/times/${datePart}.html`;
-  window.open(ghUrl, '_blank');
+  // Agora abrimos a página servida pelo PRÓPRIO backend,
+  // que lê os times salvos no Google Sheets
+  const url = `/sessions/${encodeURIComponent(datePart)}/teams`;
+  window.open(url, '_blank');
 }
 </script>
   </body>

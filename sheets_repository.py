@@ -146,12 +146,12 @@ class SheetsRepository:
                 body={"values": [["session_id", "date", "status"]]}
             ).execute()
 
-        if not header_ok(want_assign, ["session_id", "name", "email", "pref1", "assigned_pos", "out_of_pref1"]):
+        if not header_ok(want_assign, ["session_id", "team", "name", "email", "pref1", "assigned_pos", "out_of_pref1"]):
             svc.spreadsheets().values().update(
                 spreadsheetId=self.spreadsheet_id,
-                range=f"{want_assign}!A1:F1",
+                range=f"{want_assign}!A1:G1",
                 valueInputOption="RAW",
-                body={"values": [["session_id", "name", "email", "pref1", "assigned_pos", "out_of_pref1"]]}
+                body={"values": [["session_id", "team", "name", "email", "pref1", "assigned_pos", "out_of_pref1"]]}
             ).execute()
 
         if not header_ok(want_history, ["date", "name", "email", "pref1", "assigned_pos", "archived_at"]):
@@ -185,7 +185,7 @@ class SheetsRepository:
         svc = self._sheets_service()
         svc.spreadsheets().values().append(
             spreadsheetId=self.spreadsheet_id,
-            range=f"{self.assignments_tab}!A:F",  # 6 columns
+            range=f"{self.assignments_tab}!A:G",  # 6 columns
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": rows}
@@ -263,7 +263,7 @@ class SheetsRepository:
         # Read existing assignments
         res = svc.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
-            range=f"{self.assignments_tab}!A2:F"
+            range=f"{self.assignments_tab}!A2:G"
         ).execute()
         existing = res.get("values", []) or []
 
@@ -278,7 +278,7 @@ class SheetsRepository:
         if last_date and last_date != session_date:
             offpref_rows = [
                 r for r in existing
-                if len(r) >= 6 and (r[5] or "").strip().lower() == "yes"
+                if len(r) >= 7 and (r[6] or "").strip().lower() == "yes"
             ]
             if offpref_rows:
                 archived_at = datetime.utcnow().isoformat() + "Z"
@@ -328,26 +328,149 @@ class SheetsRepository:
         # Clear Assignments and re-write
         svc.spreadsheets().values().clear(
             spreadsheetId=self.spreadsheet_id,
-            range=f"{self.assignments_tab}!A2:F"
+            range=f"{self.assignments_tab}!A2:G"
         ).execute()
-
-        # Append session row
-        self._append_sessions([[session_id, session_date, "DRAFT"]])
 
         # Build assignment rows
         rows = []
         for t in teams:
-            for p in t.get("players", []):
-                if p.get("is_missing"):
-                    continue
-                name = p.get("name") or ""
-                email = (p.get("email") or "").strip().lower()
-                assigned = (p.get("pos") or "").strip().lower()
-                pref1 = (players_by_email.get(email) or {}).get("pref1", "")
-                out_flag = "yes" if (pref1 and assigned and pref1.lower() != assigned.lower()) else "no"
-                rows.append([session_id, name, email, pref1, assigned, out_flag])
+             team_number = t.get("team")  # número do time (int)
+             for p in t.get("players", []):
+                 if p.get("is_missing"):
+                     continue
+                 name = p.get("name") or ""
+                 email = (p.get("email") or "").strip().lower()
+                 assigned = (p.get("pos") or "").strip().lower()
+                 pref1 = (players_by_email.get(email) or {}).get("pref1", "")
+                 out_flag = "yes" if (pref1 and assigned and pref1.lower() != assigned.lower()) else "no"
+
+                 rows.append(
+                     [
+                          session_id,          # session_id
+                          team_number,         # team
+                          name,                # name
+                          email,               # email
+                          pref1,               # pref1
+                          assigned,            # assigned_pos
+                          out_flag,            # out_of_pref1
+                     ]
+                 )
 
         self._append_assignments(rows)
+
+    def get_teams_for_session(self, session_id: str) -> List[Dict]:
+        """
+        Reconstrói os times de uma sessão específica a partir da aba Assignments.
+
+        Retorna uma lista de dicts no formato esperado por build_teams_html:
+        [
+            {
+                "team": 1,
+                "size": 6,
+                "missing": None ou "middle",
+                "extra_player_index": None ou int,
+                "players": [
+                    {
+                        "name": ...,
+                        "email": ...,
+                        "pref1": ...,
+                        "pos": ...,
+                        "out_of_pref1": "yes"/"no",
+                        "is_missing": False
+                    },
+                    ...
+                ]
+            },
+            ...
+        ]
+        """
+        svc = self._sheets_service()
+        # lê tudo (header + linhas)
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=self.spreadsheet_id,
+            range=f"{self.assignments_tab}!A1:G"
+        ).execute()
+        values = resp.get("values", []) or []
+        if len(values) < 2:
+            return []
+
+        header = values[0]
+        rows = values[1:]
+
+        # tenta localizar os índices das colunas importantes
+        def idx(col_name: str) -> int:
+            try:
+                return header.index(col_name)
+            except ValueError:
+                return -1
+
+        idx_sid = idx("session_id")
+        idx_team = idx("team")
+        idx_name = idx("name")
+        idx_email = idx("email")
+        idx_pref1 = idx("pref1")
+        idx_pos = idx("assigned_pos")
+        idx_out = idx("out_of_pref1")
+
+        if min(idx_sid, idx_team, idx_name, idx_email, idx_pref1, idx_pos, idx_out) < 0:
+            # header não está no formato esperado
+            return []
+
+        grouped: Dict[int, List[Dict]] = {}
+
+        for r in rows:
+            # garante tamanho mínimo
+            if len(r) <= max(idx_sid, idx_team, idx_name, idx_email, idx_pref1, idx_pos, idx_out):
+                continue
+
+            sid = (r[idx_sid] or "").strip()
+            if not (sid == session_id or sid.startswith(session_id + "-")):
+                continue
+
+            team_str = (r[idx_team] or "").strip()
+            if not team_str:
+                continue
+
+            try:
+                team_number = int(team_str)
+            except ValueError:
+                continue
+
+            player = {
+                "name": r[idx_name] if idx_name >= 0 else "",
+                "email": (r[idx_email] if idx_email >= 0 else "").strip().lower(),
+                "pref1": (r[idx_pref1] if idx_pref1 >= 0 else "").strip().lower(),
+                "pos": (r[idx_pos] if idx_pos >= 0 else "").strip().lower(),
+                "out_of_pref1": (r[idx_out] if idx_out >= 0 else "").strip().lower(),
+                "is_missing": False,
+            }
+
+            grouped.setdefault(team_number, []).append(player)
+
+        teams: List[Dict] = []
+        for team_number in sorted(grouped.keys()):
+            players = grouped[team_number]
+            size = len(players)
+
+            # regra visual: times de 5 mostram "Missing — middle"
+            if size == 5:
+                missing = "middle"
+            else:
+                missing = None
+
+            # extra_player_index: como não sabemos qual era o "extra" original,
+            # deixamos None (sem destaque visual especial)
+            teams.append(
+                {
+                    "team": team_number,
+                    "size": size,
+                    "missing": missing,
+                    "extra_player_index": None,
+                    "players": players,
+                }
+            )
+
+        return teams
 
     # ---------- Control Rules (per session, per player) ----------
 
