@@ -120,26 +120,54 @@ class SlotRanker:
 
         all_setter = (p1, p2, p3) == ("setter", "setter", "setter")
 
-        # ---------- BLOCO ESPECFICO PARA MIDDLE ----------
+                # ---------- BLOCO ESPECÍFICO PARA MIDDLE ----------
         if pos == "middle":
-            # 1) F s joga middle se pref1 == "middle"
+            # 1) F só joga middle se pref1 == "middle"
             if gender == "f" and p1 != "middle":
                 return None
 
-            # 2) Se j foi off-pref nas DUAS ltimas datas, no sacrificar de novo
+            # 2) Se já foi off-pref nas DUAS últimas datas, não sacrificar de novo
             if not relaxed and off_ct >= 2:
                 return None
 
-            # 3) Verdadeiros middles tm prioridade
+            # 3) Verdadeiros middles têm prioridade máxima
             if p1 == "middle":
                 pref_rank = 1
                 going_off = False
             else:
-                # 4) BACKFILL: qualquer outro jogador elegvel tem a MESMA prioridade
-                pref_rank = 4
-                going_off = True  # est indo fora da pref1
+                # 4) BACKFILL: aqui vamos diferenciar QUEM é mais "voluntário" a ser middle
 
-            # 5) Fairness penalty: maior para quem j foi off-pref antes
+                going_off = True  # está indo fora da pref1
+
+                # Queremos uma escala de "vontade" de ser middle:
+                # número MENOR = mais disposto a ser middle
+                # número MAIOR = vai para o final da fila de backfill
+
+                # Caso 4.1 – middle em segunda preferência: ok usar como backfill
+                # exemplos: setter, middle, outside  ou  outside, middle, setter
+                if p2 == "middle":
+                    middle_willingness = 2
+
+                # Caso 4.2 – nunca pediu middle em nenhuma preferência
+                elif "middle" not in (p1, p2, p3):
+                    # nunca pediu middle → bem no final da fila
+                    middle_willingness = 6
+
+                # Caso 4.3 – middle só em 3ª preferência E as duas primeiras são setter/outside
+                # exemplos: setter, outside, middle  ou  outside, setter, middle
+                elif (p3 == "middle") and (p1 in {"setter", "outside"}) and (p2 in {"setter", "outside"}):
+                    # essa pessoa pediu claramente jogar como setter/outside
+                    # e só aceitou middle como último recurso → final da fila de backfill
+                    middle_willingness = 6
+
+                # Caso 4.4 – outros casos "neutros"
+                else:
+                    # Ex.: alguém com combinações mais estranhas onde middle não está tão rejeitado
+                    middle_willingness = 4
+
+                pref_rank = middle_willingness
+
+            # 5) Fairness penalty: maior para quem já foi off-pref antes
             fairness_penalty = 0
             if going_off:
                 fairness_penalty += off_ct * 2
