@@ -1,32 +1,28 @@
-# main.py — FastAPI + Google Sheets + Minimal UI (Upload CSV + Generate Teams → opens /teams)
+# main.py — FastAPI + OOP services (CsvParser, SheetsRepository, TeamGenerator + postprocess)
+
 from __future__ import annotations
 
-
-import csv, io, os
-from typing import List, Dict, Tuple, Optional
-from datetime import datetime, date
-from collections import defaultdict
-import random
+import os
 import base64
 import json
+import random
+from typing import List, Dict, Optional
+from datetime import datetime, date
 
 import requests
-
 from fastapi import FastAPI, UploadFile, File, Body
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from googleapiclient.discovery import build
-from google.oauth2.service_account import Credentials as ServiceAccountCredentials
-
-from algorithm import generate_teams  # <- pure logic module
+from csv_parser import CsvParser
+from sheets_repository import SheetsRepository
+from algorithm import TeamGenerator, postprocess_teams  # postprocess_teams será implementado no algorithm.py
 
 # ----------------------- Config -----------------------
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 SESSIONS_TAB = os.getenv("SESSIONS_TAB", "Sessions")
 ASSIGNMENTS_TAB = os.getenv("ASSIGNMENTS_TAB", "Assignments")
 
-# No UI changes: manter o mesmo conjunto de inputs/botões
-app = FastAPI(title="Volleyball Teams — CSV → Generate")
+app = FastAPI(title="Volleyball Teams — OOP Version")
 
 STATE = {
     "players": [],    # [{name, gender, email, pref1, pref2, pref3}]
@@ -34,425 +30,32 @@ STATE = {
     "source": "",
     "updated_at": None,
     "seed": None,
-    "session_id": None,   # last generated session_id (DRAFT)
+    "session_id": None,
 }
 
-VALID_POS = {"setter", "middle", "oppo", "outside"}
+csv_parser = CsvParser()
+sheets_repo = SheetsRepository(
+    spreadsheet_id=GOOGLE_SHEET_ID,
+    sessions_tab=SESSIONS_TAB,
+    assignments_tab=ASSIGNMENTS_TAB,
+    history_tab="History",
+    service_account_file="service_account.json",
+)
+
 
 # ----------------- Helpers ---------------------------
 def _touch_state():
     STATE["updated_at"] = datetime.utcnow().isoformat() + "Z"
 
+
 def _norm(s: Optional[str]) -> str:
     return (s or "").strip().lower()
 
-# ----------------- Google API ------------------------
-def credentials():
-    """
-    Load service account credentials from the JSON key file.
-    """
-    service_account_file = "service_account.json"  # your key file name
-    if not os.path.exists(service_account_file):
-        raise RuntimeError("service_account.json not found. Place it in the project folder.")
-    creds = ServiceAccountCredentials.from_service_account_file(
-        service_account_file,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-    return creds
 
-def sheets_service():
-    if not GOOGLE_SHEET_ID:
-        raise RuntimeError("Set GOOGLE_SHEET_ID in the environment.")
-    # cache_discovery=False evita warnings locais
-    return build("sheets", "v4", credentials=credentials(), cache_discovery=False)
+# ----------------- HTML snapshot helpers ------------------------
 
-# ----------------- CSV Parsing ------------------------
-def _normalize_pos(x: str) -> str:
-    """Normalize position strings coming from the CSV/Form.
-
-    Accepts variations like:
-    - "Outside", "Oppo", "Outside/Oppo", "Outside hitter", etc → "outside"
-    - "Middle", "Middle blocker" → "middle"
-    - "Setter" → "setter"
-    Anything else becomes empty string (invalid position).
-    """
-    v = _norm(x)
-    if not v:
-        return ""
-    # Outside / opposite variants
-    if "outside" in v or "oppo" in v or "opposite" in v:
-        return "outside"
-    # Middle variants
-    if "middle" in v:
-        return "middle"
-    # Setter variants
-    if "setter" in v:
-        return "setter"
-    return ""
-
-def parse_csv_bytes(b: bytes) -> List[Dict[str, str]]:
-    text = b.decode("utf-8", errors="ignore")
-    out: List[Dict[str, str]] = []
-    reader = csv.DictReader(io.StringIO(text))
-
-    for row in reader:
-        # normaliza cabeçalhos para minúsculo
-        row_ci = { (k or '').strip().lower(): (v or '').strip() for k, v in row.items() }
-
-        # Nome (mantém sua lógica atual)
-        name = row_ci.get("name") or row_ci.get("player") or row_ci.get("jogador")
-
-        # Email
-        email = (row_ci.get("email") or row_ci.get("e-mail") or row_ci.get("mail") or "").strip().lower()
-
-        # Gênero (se existir)
-        gender = (row_ci.get("gender") or "").lower()
-
-        # >>> AGORA BEM SIMPLES: usa só os três nomes padrão <<<
-        p1 = _normalize_pos(row_ci.get("y-preferred-position-1") or "")
-        p2 = _normalize_pos(row_ci.get("y-preferred-position-2") or "")
-        p3 = _normalize_pos(row_ci.get("y-preferred-position-3") or "")
-
-        if not name or not email:
-            continue  # mantém a regra: precisa de nome e e-mail
-
-        # se as três prefs forem iguais, zera p2/p3
-        if p1 and p1 == p2 == p3:
-            p2 = ""
-            p3 = ""
-
-        out.append({
-            "name": name,
-            "gender": gender,
-            "email": email,
-            "pref1": p1,
-            "pref2": p2,
-            "pref3": p3,
-        })
-
-    return out
-
-# ----------------- Sheets I/O -------------------------
-def ensure_tabs_and_headers():
-    svc = sheets_service()
-    meta = svc.spreadsheets().get(spreadsheetId=GOOGLE_SHEET_ID).execute()
-
-    # normaliza títulos existentes
-    titles_raw = [s["properties"]["title"] for s in meta.get("sheets", [])]
-    titles_norm = { (t or "").strip().lower() for t in titles_raw }
-
-    want_sessions = (SESSIONS_TAB or "Sessions").strip()
-    want_assign   = (ASSIGNMENTS_TAB or "Assignments").strip()
-    want_history  = "History"
-
-    need_sessions = want_sessions.strip().lower() not in titles_norm
-    need_assign   = want_assign.strip().lower()   not in titles_norm
-    need_history  = want_history.strip().lower()  not in titles_norm
-
-    requests = []
-    if need_sessions:
-        requests.append({"addSheet": {"properties": {"title": want_sessions}}})
-    if need_assign:
-        requests.append({"addSheet": {"properties": {"title": want_assign}}})
-    if need_history:
-        requests.append({"addSheet": {"properties": {"title": want_history}}})
-
-    if requests:
-        try:
-            svc.spreadsheets().batchUpdate(
-                spreadsheetId=GOOGLE_SHEET_ID,
-                body={"requests": requests}
-            ).execute()
-        except Exception as e:
-            # Se outro processo criou a aba no meio tempo ou há variação de nome,
-            # ignoramos erros de "already exists".
-            msg = str(e).lower()
-            if "already exists" not in msg:
-                raise
-
-    # ----- headers -----
-    def header_ok(tab: str, expected: list[str]) -> bool:
-        res = svc.spreadsheets().values().get(
-            spreadsheetId=GOOGLE_SHEET_ID, range=f"{tab}!A1:Z1"
-        ).execute()
-        vals = res.get("values", [])
-        if not vals:
-            return False
-        row = [c.strip() for c in vals[0]]
-        return row[:len(expected)] == expected
-
-    if not header_ok(want_sessions, ["session_id", "date", "status"]):
-        svc.spreadsheets().values().update(
-            spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"{want_sessions}!A1:C1",
-            valueInputOption="RAW",
-            body={"values": [["session_id", "date", "status"]]}
-        ).execute()
-
-    if not header_ok(want_assign, ["session_id", "name", "email", "pref1", "assigned_pos", "out_of_pref1"]):
-        svc.spreadsheets().values().update(
-            spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"{want_assign}!A1:F1",
-            valueInputOption="RAW",
-            body={"values": [["session_id", "name", "email", "pref1", "assigned_pos", "out_of_pref1"]]}
-        ).execute()
-
-    if not header_ok(want_history, ["date", "name", "email", "pref1", "assigned_pos", "archived_at"]):
-        svc.spreadsheets().values().update(
-            spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"{want_history}!A1:F1",
-            valueInputOption="RAW",
-            body={"values": [["date", "name", "email", "pref1", "assigned_pos", "archived_at"]]}
-        ).execute()
-
-def _append_sessions(rows: List[List[str]]):
-    if not rows: return
-    svc = sheets_service()
-    svc.spreadsheets().values().append(
-        spreadsheetId=GOOGLE_SHEET_ID,
-        range=f"{SESSIONS_TAB}!A:C",
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body={"values": rows}
-    ).execute()
-
-def _append_assignments(rows: List[List[str]]):
-    if not rows: return
-    svc = sheets_service()
-    svc.spreadsheets().values().append(
-        spreadsheetId=GOOGLE_SHEET_ID,
-        range=f"{ASSIGNMENTS_TAB}!A:F",  # 6 colunas, alinhado ao header
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body={"values": rows}
-    ).execute()
-
-def _append_draft_session_with_assignments(session_id: str, session_date: str, teams: List[Dict], players_by_email: Dict[str, Dict]):
-    """
-    Store a DRAFT session and its assignments.
-    - Mesmo dia: limpa Assignments e grava nova geração.
-    - Mudou o dia: move off-pref do dia anterior para History (date-first), depois limpa Assignments.
-    - Retenção do History: 5 datas.
-    """
-    svc = sheets_service()
-
-    # Ler Assignments atuais
-    res = svc.spreadsheets().values().get(
-        spreadsheetId=GOOGLE_SHEET_ID, range=f"{ASSIGNMENTS_TAB}!A2:F"
-    ).execute()
-    existing = res.get("values", []) or []
-
-    # Detectar data anterior pela session_id da primeira linha (prefixo YYYY-MM-DD)
-    last_date = None
-    if existing:
-        first_sid = existing[0][0] if existing[0] else ""
-        if first_sid and len(first_sid) >= 10:
-            last_date = first_sid[:10]
-
-    # Se mudou o dia → arquivar off-pref do dia anterior no History
-    if last_date and last_date != session_date:
-        offpref_rows = [r for r in existing if len(r) >= 6 and (r[5] or "").strip().lower() == "yes"]
-        if offpref_rows:
-            archived_at = datetime.utcnow().isoformat() + "Z"
-            body = {
-                "values": [[last_date, r[1], r[2], r[3], r[4], archived_at] for r in offpref_rows]  # date,name,email,pref1,assigned_pos,archived_at
-            }
-            svc.spreadsheets().values().append(
-                spreadsheetId=GOOGLE_SHEET_ID,
-                range="History!A:F",
-                valueInputOption="RAW",
-                insertDataOption="INSERT_ROWS",
-                body=body
-            ).execute()
-
-        # Retenção do History: manter só 5 datas
-        try:
-            hres = svc.spreadsheets().values().get(
-                spreadsheetId=GOOGLE_SHEET_ID, range="History!A2:F"
-            ).execute()
-            hrows = hres.get("values", []) or []
-            dates = []
-            for r in hrows:
-                if r and len(r) >= 1 and (r[0] or "").strip():
-                    dates.append((r[0].strip(), r))
-            distinct = sorted({d for d, _ in dates})
-            if len(distinct) > 5:
-                keep = set(sorted(distinct, reverse=True)[:5])  # 5 datas mais recentes
-                keep_rows = [r for r in hrows if r and (r[0] or "").strip() in keep]
-                svc.spreadsheets().values().clear(
-                    spreadsheetId=GOOGLE_SHEET_ID, range="History!A2:F"
-                ).execute()
-                if keep_rows:
-                    svc.spreadsheets().values().update(
-                        spreadsheetId=GOOGLE_SHEET_ID,
-                        range="History!A2",
-                        valueInputOption="RAW",
-                        body={"values": keep_rows}
-                    ).execute()
-        except Exception:
-            pass
-
-    # Limpar Assignments e regravar do zero
-    svc.spreadsheets().values().clear(
-        spreadsheetId=GOOGLE_SHEET_ID, range=f"{ASSIGNMENTS_TAB}!A2:F"
-    ).execute()
-
-    # Adicionar linha de sessão (controle)
-    _append_sessions([[session_id, session_date, "DRAFT"]])
-
-    # Construir linhas para Assignments (com email)
-    rows = []
-    for t in teams:
-        for p in t.get("players", []):
-            if p.get("is_missing"):
-                continue
-            name = p.get("name") or ""
-            email = (p.get("email") or "").strip().lower()
-            assigned = (p.get("pos") or "").strip().lower()
-            pref1 = (players_by_email.get(email) or {}).get("pref1", "")
-            out_flag = "yes" if (pref1 and assigned and pref1.lower() != assigned.lower()) else "no"
-            rows.append([session_id, name, email, pref1, assigned, out_flag])
-
-    _append_assignments(rows)
-
-def _last_two_offpref_maps_by_email_from_history() -> Tuple[Dict[str, int], Dict[str, bool]]:
-    """
-    Lê a aba History (date, name, email, pref1, assigned_pos, archived_at),
-    pega as DUAS últimas datas e computa:
-      - count_map: email_id -> 0..2
-      - any_map:   email_id -> True/False
-    """
-    svc = sheets_service()
-    res = svc.spreadsheets().values().get(
-        spreadsheetId=GOOGLE_SHEET_ID, range="History!A2:F"
-    ).execute()
-    rows = res.get("values", []) or []
-
-    # Agrupar por data (coluna 0)
-    by_date: Dict[str, List[List[str]]] = defaultdict(list)
-    for r in rows:
-        if not r or len(r) < 5:
-            continue
-        date_str = (r[0] or "").strip()
-        if not date_str:
-            continue
-        by_date[date_str].append(r)
-
-    if not by_date:
-        return {}, {}
-
-    # Datas em ordem desc
-    dates_sorted = sorted(by_date.keys(), reverse=True)
-    last_two = dates_sorted[:2]
-
-    count_map: Dict[str, int] = defaultdict(int)
-    any_map: Dict[str, bool] = defaultdict(bool)
-
-    for d in last_two:
-        for r in by_date[d]:
-            # r: [date, name, email, pref1, assigned_pos, archived_at]
-            email = (r[2] if len(r) > 2 else "").strip().lower()
-            pref1 = (r[3] if len(r) > 3 else "").strip().lower()
-            assigned = (r[4] if len(r) > 4 else "").strip().lower()
-            if not email:
-                continue
-            off = (pref1 and assigned and pref1 != assigned)
-            if off:
-                count_map[email] += 1
-                any_map[email] = True
-            else:
-                any_map.setdefault(email, any_map[email])
-
-    for k in list(count_map.keys()):
-        count_map[k] = min(2, max(0, count_map[k]))
-    return dict(count_map), dict(any_map)
-
-# ----------------- Endpoints ---------------------------
-@app.post("/upload-csv")
-def upload_csv(file: UploadFile = File(...)):
-    content = file.file.read()
-    players = parse_csv_bytes(content)
-    players = [p for p in players if p.get("name") and p.get("email")]
-    if not players:
-        return JSONResponse({"ok": False, "error": "No players parsed from CSV."}, status_code=422)
-    STATE["players"] = players
-    STATE["teams"] = []
-    STATE["source"] = f"upload:{file.filename}"
-    _touch_state()
-    return {"ok": True, "source": STATE["source"], "total_players": len(players), "players": players, "updated_at": STATE["updated_at"]}
-
-@app.post("/generate-teams")
-def generate(payload: Optional[dict] = Body(default=None)):
-    """
-    Generate teams using current players list.
-    Fairness: sempre baseado nas DUAS últimas datas do History (por e-mail).
-    Esta geração é gravada como DRAFT e substitui Assignments do dia corrente.
-    Body (opcional): {"seed": 123, "session_date": "YYYY-MM-DD"}
-    """
-    players = STATE.get("players", [])
-    if not players:
-        return JSONResponse({"ok": False, "error": "No players loaded. Upload a CSV first."}, status_code=409)
-
-    ensure_tabs_and_headers()
-
-    # Determine date and optional seed
-    today = date.today()
-    seed = None
-    if payload:
-        if "seed" in payload:
-            try:
-                seed = int(payload["seed"])
-            except Exception:
-                seed = None
-        if "session_date" in payload:
-            try:
-                y, m, d = [int(x) for x in str(payload["session_date"]).split("-")]
-                today = date(y, m, d)
-            except Exception:
-                pass
-
-    # Fairness maps das DUAS últimas datas em History (por e-mail)
-    try:
-        last_two_count_map, last_two_any_map = _last_two_offpref_maps_by_email_from_history()
-    except Exception:
-        last_two_count_map, last_two_any_map = {}, {}
-
-    teams = generate_teams(
-        players,
-        seed=seed,
-        last_two_offpref_count_by_id=last_two_count_map,
-        last_two_any_offpref_by_id=last_two_any_map
-    )
-
-    # Save como DRAFT
-    session_id = f"{today.isoformat()}-{datetime.utcnow().strftime('%H%M%S')}"
-    players_by_email = {(p.get("email") or "").strip().lower(): p for p in players}
-    try:
-        _append_draft_session_with_assignments(session_id, today.isoformat(), teams, players_by_email)
-    except Exception:
-        # não quebra a geração se falhar escrita no Sheets
-        pass
-
-    STATE["teams"] = teams
-    STATE["seed"] = seed
-    STATE["session_id"] = session_id
-    _touch_state()
-
-    # 🔹 gera HTML estático e manda pro GitHub Pages
-    try:
-        html_snapshot = build_teams_html(teams)
-        # usa a data da sessão (today) no formato YYYY-MM-DD
-        date_str = today.isoformat()
-        push_snapshot_to_github(html_snapshot, date_str)
-    except Exception:
-        # se falhar, não interrompe a geração dos times
-        pass
-
-    return {"ok": True, "session_id": session_id, "teams": teams, "updated_at": STATE["updated_at"]}
 def build_teams_html(teams: List[Dict]) -> str:
-    """Build the static HTML for the teams page.
-    Used both for /teams and for GitHub snapshots.
-    """
+    """Build the static HTML for the teams page."""
     # Contagem por nome para detectar homônimos
     name_counts: Dict[str, int] = {}
     for t in teams:
@@ -527,7 +130,6 @@ def push_snapshot_to_github(html: str, date_str: str) -> None:
     """
     Push a static HTML snapshot for the given date to the GitHub Pages repo.
     - date_str: 'YYYY-MM-DD'
-    O arquivo será salvo em: {GH_BASE_PATH}/{date_str}.html
     """
 
     gh_token = os.getenv("GH_TOKEN", "").strip()
@@ -536,7 +138,6 @@ def push_snapshot_to_github(html: str, date_str: str) -> None:
     base_path = os.getenv("GH_BASE_PATH", "times").strip()
 
     if not gh_token or not gh_repo:
-        # Se não estiver configurado, não quebra a geração
         return
 
     owner_repo = gh_repo  # formato 'user/repo'
@@ -574,8 +175,227 @@ def push_snapshot_to_github(html: str, date_str: str) -> None:
     try:
         requests.put(api_url, headers=headers, data=json.dumps(body))
     except Exception:
-        # Se der erro, só não publica, mas não quebra o algoritmo
         pass
+
+
+# ----------------- API: Control rules (GET/POST) --------------------
+
+@app.get("/api/sessions/{session_key}/rules")
+def get_session_rules(session_key: str):
+    """
+    Return all soft-control rules for a given session_key (e.g. '2025-11-20').
+    Used by the /control page to load current rules of the day.
+    """
+    try:
+        sheets_repo.ensure_tabs_and_headers()
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"Sheets error: {e}"}, status_code=500)
+
+    try:
+        raw_rules = sheets_repo.get_control_rules_for_session(session_key)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"Error reading rules: {e}"}, status_code=500)
+
+    # raw_rules já vem em formato estruturado do SheetsRepository
+    return {"ok": True, "session_key": session_key, "rules": raw_rules}
+
+
+@app.post("/api/sessions/{session_key}/rules")
+def save_session_rules(session_key: str, payload: dict = Body(...)):
+    """
+    Save a snapshot of soft-control rules for a given session_key.
+    The payload should be:
+      {
+        "session_key": "...",
+        "rules": [
+           {
+             "player_email": "...",
+             "cannot_play_positions": [...],
+             "must_play_with": [...],
+             "cannot_play_with": [...]
+           },
+           ...
+        ]
+      }
+    """
+    if not payload:
+        return JSONResponse({"ok": False, "error": "Missing payload."}, status_code=400)
+
+    body_session = (payload.get("session_key") or "").strip()
+    if body_session and body_session != session_key:
+        return JSONResponse(
+            {"ok": False, "error": "session_key mismatch between URL and body."},
+            status_code=400,
+        )
+
+    rules = payload.get("rules") or []
+    if not isinstance(rules, list):
+        return JSONResponse({"ok": False, "error": "'rules' must be a list."}, status_code=400)
+
+    try:
+        sheets_repo.ensure_tabs_and_headers()
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"Sheets error: {e}"}, status_code=500)
+
+    try:
+        normalized = sheets_repo.append_control_rules_snapshot(session_key, rules)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"Error saving rules: {e}"}, status_code=500)
+
+    return {"ok": True, "session_key": session_key, "rules": normalized}
+
+
+# ----------------- Endpoints: CSV + Generate teams ---------------------------
+
+@app.post("/upload-csv")
+async def upload_csv(file: UploadFile = File(...)):
+    """
+    Step 1: receber CSV e guardar players no STATE, usando CsvParser.
+    """
+    content = await file.read()
+    players = csv_parser.parse_players_from_bytes(content)
+    players = [p for p in players if p.get("name") and p.get("email")]
+    if not players:
+        return JSONResponse({"ok": False, "error": "No players parsed from CSV."}, status_code=422)
+
+    STATE["players"] = players
+    STATE["teams"] = []
+    STATE["source"] = f"upload:{file.filename}"
+    _touch_state()
+    return {
+        "ok": True,
+        "source": STATE["source"],
+        "total_players": len(players),
+        "players": players,
+        "updated_at": STATE["updated_at"],
+    }
+
+
+@app.post("/generate-teams")
+async def generate(payload: Optional[dict] = Body(default=None)):
+    """
+    Step 2: usar TeamGenerator + SheetsRepository + regras de controle.
+    - lê STATE["players"]
+    - usa histórico do Sheets para fairness
+    - aplica keep_pref1 na geração (via keep_pref_emails)
+    - aplica pós-processamento (must_play_with / cannot_play_with / cannot_play_positions)
+    - salva sessão/assignments no Sheets
+    - gera snapshot HTML no GitHub
+    """
+    players = STATE.get("players", [])
+    if not players:
+        return JSONResponse(
+            {"ok": False, "error": "No players loaded. Upload a CSV first."},
+            status_code=409,
+        )
+
+    # garantir abas e headers
+    try:
+        sheets_repo.ensure_tabs_and_headers()
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"Sheets error: {e}"}, status_code=500)
+
+    # ---------- determinar date e seed ----------
+    today = date.today()
+    seed: Optional[int] = None
+
+    if payload:
+        if "seed" in payload:
+            try:
+                seed = int(payload["seed"])
+            except Exception:
+                seed = None
+        if "session_date" in payload:
+            try:
+                y, m, d = [int(x) for x in str(payload["session_date"]).split("-")]
+                today = date(y, m, d)
+            except Exception:
+                pass
+
+    # ---------- Regras de controle do dia → keep_pref_emails + session_rules ----------
+    session_key = today.isoformat()
+    try:
+        session_rules = sheets_repo.get_control_rules_for_session(session_key)
+    except Exception:
+        session_rules = []
+
+    keep_pref_emails: set[str] = set()
+    for rule in session_rules:
+        email = (rule.get("player_email") or "").strip().lower()
+        if not email:
+            continue
+        # critério: se tem alguma posição em cannot_play_positions marcada,
+        # tratamos esse jogador como "protegido" (keep pref1)
+        cannot_positions = rule.get("cannot_play_positions") or []
+        if cannot_positions:
+            keep_pref_emails.add(email)
+
+    # ---------- fairness das duas últimas datas ----------
+    try:
+        last_two_count_map, last_two_any_map = sheets_repo.get_last_two_offpref_maps_by_email()
+    except Exception:
+        last_two_count_map, last_two_any_map = {}, {}
+
+    # ---------- gerar times via TeamGenerator (keep_pref_emails entra aqui) ----------
+    generator = TeamGenerator(
+        players,
+        seed=seed,
+        last_two_offpref_count_by_id=last_two_count_map,
+        last_two_any_offpref_by_id=last_two_any_map,
+        keep_pref_emails=keep_pref_emails,
+    )
+    teams = generator.generate()
+
+    # ---------- pós-processamento de regras (must / cannot play with / cannot positions) ----------
+    try:
+        teams = postprocess_teams(
+            teams=teams,
+            session_rules=session_rules,
+            last_two_offpref_count_by_id=last_two_count_map,
+            last_two_any_offpref_by_id=last_two_any_map,
+        )
+    except Exception:
+        # se der erro no pós-processo, seguimos com os times originais
+        pass
+
+    # ---------- salvar no Sheets ----------
+    session_id = f"{today.isoformat()}-{datetime.utcnow().strftime('%H%M%S')}"
+    players_by_email = {
+        (p.get("email") or "").strip().lower(): p
+        for p in players
+    }
+    try:
+        sheets_repo.save_draft_session_with_assignments(
+            session_id=session_id,
+            session_date=today.isoformat(),
+            teams=teams,
+            players_by_email=players_by_email,
+        )
+    except Exception:
+        # não quebra a geração se der erro de escrita
+        pass
+
+    # ---------- atualizar STATE ----------
+    STATE["teams"] = teams
+    STATE["seed"] = seed
+    STATE["session_id"] = session_id
+    _touch_state()
+
+    # ---------- snapshot HTML → GitHub Pages ----------
+    try:
+        html_snapshot = build_teams_html(teams)
+        date_str = today.isoformat()
+        push_snapshot_to_github(html_snapshot, date_str)
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "teams": teams,
+        "updated_at": STATE["updated_at"],
+    }
+
 
 @app.get("/teams", response_class=HTMLResponse)
 def show_teams():
@@ -584,6 +404,8 @@ def show_teams():
         return "<p>No teams yet. Upload a CSV and click 'Generate Teams'.</p>"
     html = build_teams_html(teams)
     return html
+
+
 @app.post("/reset")
 def reset_all():
     STATE["players"] = []
@@ -594,7 +416,9 @@ def reset_all():
     _touch_state()
     return {"ok": True, **STATE}
 
-# ----------------- Minimal Frontend (inalterado) --------------------
+
+# ----------------- Minimal Frontend (coach page) --------------------
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
@@ -687,17 +511,378 @@ async function generateTeams(){
     return;
   }
 
-  // session_id vem assim: "2025-11-18-123456"
   const sessionId = d.session_id || '';
   const datePart = sessionId.substring(0, 10); // "2025-11-18"
 
-  // URL do GitHub Pages (pasta 'times')
   const ghUrl = `https://spikersmelbourne.github.io/volleyball-teams-pages/times/${datePart}.html`;
-
-  // Abre direto a página sem cache
-  window.open(`${ghUrl}?v=${Date.now()}`, '_blank');
+  window.open(ghUrl, '_blank');
 }
 </script>
+  </body>
+</html>
+"""
+
+# ----------------- Control page (admin) --------------------
+
+@app.get("/control", response_class=HTMLResponse)
+def control_panel():
+    """
+    Admin control page (simplified):
+    - Session key = always today (YYYY-MM-DD), automatic.
+    - One small form to add a rule:
+        * player email
+        * rule type (3 options)
+          - keep_pref1  -> marked internally via cannot_play_positions = ["keep_pref1"]
+          - must_play_with
+          - cannot_play_with
+    - A list showing current rules for today.
+    """
+    return """
+<!doctype html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Control Rules - Simple</title>
+    <style>
+      body { font-family: system-ui, Arial; padding:16px; max-width: 720px; margin: 0 auto; }
+      h2 { margin-top: 0; }
+      label { font-size: 14px; display:block; margin-bottom:4px; }
+      input[type="text"], select {
+        padding:6px 8px;
+        font-size:14px;
+        border-radius:4px;
+        border:1px solid #ccc;
+        width: 100%;
+        box-sizing: border-box;
+      }
+      .field { margin-bottom: 10px; }
+      .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+      button {
+        font-size: 14px;
+        padding: 6px 12px;
+        margin: 2px 0;
+        border: 1px solid #ccc;
+        border-radius: 6px;
+        background: #f5f5f5;
+        cursor: pointer;
+        transition: background 0.2s, transform 0.05s;
+      }
+      button:hover { background:#e0e0e0; }
+      button:active { background:#ccc; transform: scale(0.98); }
+      button.small {
+        font-size: 12px;
+        padding: 3px 8px;
+      }
+      button.danger {
+        border-color:#c62828;
+        color:#c62828;
+        background:#fff5f5;
+      }
+      .hint { font-size:12px; opacity:0.7; }
+      #rulesList {
+        margin-top:14px;
+        padding-left:0;
+        list-style:none;
+        font-size:14px;
+      }
+      #rulesList li {
+        border-bottom:1px solid #eee;
+        padding:6px 0;
+        display:flex;
+        justify-content:space-between;
+        align-items:center;
+      }
+      #status {
+        margin-top:10px;
+        font-size:13px;
+        opacity:0.8;
+      }
+      @media (prefers-color-scheme: dark) {
+        body { background:#111; color:#eee; }
+        input[type="text"], select {
+          background:#111;
+          color:#eee;
+          border-color:#444;
+        }
+        button { background:#222; color:#eee; border-color:#333; }
+        button:hover { background:#333; }
+        button.danger { background:#331111; border-color:#c62828; color:#ff8a80; }
+        #rulesList li { border-color:#333; }
+      }
+    </style>
+  </head>
+  <body>
+    <h2>Control Rules – Simple Admin</h2>
+
+    <div class="field">
+      <strong>Session (today):</strong>
+      <span id="sessionKeyLabel"></span>
+      <div class="hint">
+        All rules created here will use today's date as session_key.
+      </div>
+    </div>
+
+    <hr/>
+
+    <h3>Add / update rule for a player</h3>
+
+    <div class="field">
+      <label for="playerEmail">Player email</label>
+      <input type="text" id="playerEmail" placeholder="player@example.com" />
+    </div>
+
+    <div class="field">
+      <label for="ruleType">Rule type</label>
+      <select id="ruleType" onchange="onRuleTypeChange()">
+        <option value="keep_pref1">Keep in first preference</option>
+        <option value="must_play_with">Must play with</option>
+        <option value="cannot_play_with">Cannot play with</option>
+      </select>
+      <div class="hint">
+        "Keep in first preference" means we will strongly try to keep this player in their pref1 position.
+      </div>
+    </div>
+
+    <div class="field" id="otherEmailField" style="display:none;">
+      <label for="otherEmail">Other player email</label>
+      <input type="text" id="otherEmail" placeholder="other@example.com" />
+      <div class="hint">Used when rule type is "Must play with" or "Cannot play with".</div>
+    </div>
+
+    <div class="row" style="margin-top:8px;">
+      <button onclick="addRule()">Add / update rule</button>
+    </div>
+
+    <hr/>
+
+    <h3>Current rules for today</h3>
+    <div class="hint">
+      Each line below represents all rules for one player (email).
+    </div>
+    <ul id="rulesList"></ul>
+
+    <div class="row" style="margin-top:10px;">
+      <button onclick="saveRules()">Save all rules to Google Sheets</button>
+    </div>
+
+    <div id="status"></div>
+
+<script>
+let sessionKey = "";
+// email -> { player_email, cannot_play_positions[], must_play_with[], cannot_play_with[], keep_pref1: bool }
+let rulesByEmail = {};
+
+function setStatus(msg, isError=false) {
+  const el = document.getElementById('status');
+  el.innerText = msg || '';
+  el.style.color = isError ? '#c62828' : '';
+}
+
+function onRuleTypeChange() {
+  const type = document.getElementById('ruleType').value;
+  const otherField = document.getElementById('otherEmailField');
+
+  if (type === 'keep_pref1') {
+    otherField.style.display = 'none';
+  } else {
+    otherField.style.display = 'block';
+  }
+}
+
+function refreshRulesList() {
+  const ul = document.getElementById('rulesList');
+  ul.innerHTML = '';
+
+  const emails = Object.keys(rulesByEmail).sort();
+  if (!emails.length) {
+    const li = document.createElement('li');
+    li.innerText = 'No rules for today yet.';
+    ul.appendChild(li);
+    return;
+  }
+
+  for (const email of emails) {
+    const rule = rulesByEmail[email];
+    const li = document.createElement('li');
+
+    const left = document.createElement('div');
+    const parts = [];
+
+    if (rule.keep_pref1) {
+      parts.push('keep in first preference');
+    }
+    if (rule.must_play_with && rule.must_play_with.length) {
+      parts.push(`must play with: ${rule.must_play_with.join(',')}`);
+    }
+    if (rule.cannot_play_with && rule.cannot_play_with.length) {
+      parts.push(`cannot play with: ${rule.cannot_play_with.join(',')}`);
+    }
+
+    const text = parts.length ? parts.join(' | ') : '(no constraints)';
+    left.innerHTML = `<strong>${email}</strong><br/><span>${text}</span>`;
+
+    const right = document.createElement('div');
+    const btnRemove = document.createElement('button');
+    btnRemove.innerText = 'Remove';
+    btnRemove.className = 'small danger';
+    btnRemove.onclick = () => {
+      delete rulesByEmail[email];
+      refreshRulesList();
+    };
+    right.appendChild(btnRemove);
+
+    li.appendChild(left);
+    li.appendChild(right);
+    ul.appendChild(li);
+  }
+}
+
+function addRule() {
+  const emailInput = document.getElementById('playerEmail');
+  const typeSelect = document.getElementById('ruleType');
+  const otherEmailInput = document.getElementById('otherEmail');
+
+  const email = (emailInput.value || '').trim().toLowerCase();
+  if (!email) {
+    alert('Inform the player email.');
+    return;
+  }
+
+  if (!rulesByEmail[email]) {
+    rulesByEmail[email] = {
+      player_email: email,
+      cannot_play_positions: [],
+      must_play_with: [],
+      cannot_play_with: [],
+      keep_pref1: false,
+    };
+  }
+
+  const type = typeSelect.value;
+
+  if (type === 'keep_pref1') {
+    // Marcamos como "keep pref1" e usamos cannot_play_positions APENAS como flag
+    rulesByEmail[email].keep_pref1 = true;
+    rulesByEmail[email].cannot_play_positions = ['keep_pref1'];
+  } else if (type === 'must_play_with') {
+    const other = (otherEmailInput.value || '').trim().toLowerCase();
+    if (!other) {
+      alert('Inform the other player email.');
+      return;
+    }
+    if (!rulesByEmail[email].must_play_with.includes(other)) {
+      rulesByEmail[email].must_play_with.push(other);
+    }
+  } else if (type === 'cannot_play_with') {
+    const other = (otherEmailInput.value || '').trim().toLowerCase();
+    if (!other) {
+      alert('Inform the other player email.');
+      return;
+    }
+    if (!rulesByEmail[email].cannot_play_with.includes(other)) {
+      rulesByEmail[email].cannot_play_with.push(other);
+    }
+  }
+
+  otherEmailInput.value = '';
+  refreshRulesList();
+  setStatus('Rule added/updated locally. Remember to click "Save all rules".');
+}
+
+async function loadRulesForToday() {
+  if (!sessionKey) return;
+  setStatus('Loading rules for today...');
+
+  try {
+    const resp = await fetch(`/api/sessions/${encodeURIComponent(sessionKey)}/rules`);
+    if (!resp.ok) {
+      setStatus('Error loading rules: ' + resp.status, true);
+      return;
+    }
+    const data = await resp.json();
+    const rules = data.rules || [];
+    rulesByEmail = {};
+
+    for (const r of rules) {
+      const email = (r.player_email || '').toLowerCase();
+      if (!email) continue;
+
+      const cps = r.cannot_play_positions || [];
+      const keepPref1 = Array.isArray(cps) && cps.length > 0; // qualquer valor → flag de keep_pref1
+
+      rulesByEmail[email] = {
+        player_email: email,
+        cannot_play_positions: cps,
+        must_play_with: r.must_play_with || [],
+        cannot_play_with: r.cannot_play_with || [],
+        keep_pref1: keepPref1,
+      };
+    }
+
+    refreshRulesList();
+    setStatus(`Loaded ${rules.length} rule(s) for today.`);
+  } catch (err) {
+    console.error(err);
+    setStatus('Error loading rules (network or server).', true);
+  }
+}
+
+async function saveRules() {
+  if (!sessionKey) {
+    setStatus('No session key (today) detected.', true);
+    return;
+  }
+
+  const rules = Object.values(rulesByEmail).map(r => ({
+    player_email: r.player_email,
+    cannot_play_positions: r.cannot_play_positions || [],
+    must_play_with: r.must_play_with || [],
+    cannot_play_with: r.cannot_play_with || [],
+  }));
+
+  setStatus('Saving rules...');
+
+  try {
+    const resp = await fetch(`/api/sessions/${encodeURIComponent(sessionKey)}/rules`, {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json' },
+      body: JSON.stringify({
+        session_key: sessionKey,
+        rules: rules
+      })
+    });
+
+    if (!resp.ok) {
+      setStatus('Error saving rules: ' + resp.status, true);
+      return;
+    }
+
+    const data = await resp.json();
+    const savedCount = (data.rules || []).length;
+    setStatus(`Saved snapshot with ${savedCount} rule(s) for session ${sessionKey}.`);
+  } catch (err) {
+    console.error(err);
+    setStatus('Error saving rules (network or server).', true);
+  }
+}
+
+(function init() {
+  try {
+    const today = new Date();
+    const yyyy = today.getFullYear();
+    const mm = String(today.getMonth() + 1).padStart(2, '0');
+    const dd = String(today.getDate()).padStart(2, '0');
+    sessionKey = `${yyyy}-${mm}-${dd}`;
+    document.getElementById('sessionKeyLabel').innerText = sessionKey;
+  } catch (e) {
+    sessionKey = '';
+  }
+
+  onRuleTypeChange();
+  loadRulesForToday();
+})();
+</script>
+
   </body>
 </html>
 """
