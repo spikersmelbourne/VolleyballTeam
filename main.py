@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import base64
 import json
-import random
 from typing import List, Dict, Optional
 from datetime import datetime, date
 
@@ -15,7 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from csv_parser import CsvParser
 from sheets_repository import SheetsRepository
-from algorithm import TeamGenerator, postprocess_teams  # postprocess_teams será implementado no algorithm.py
+from algorithm import TeamGenerator, TemplatePlanner, postprocess_teams
 
 # ----------------------- Config -----------------------
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
@@ -125,6 +124,7 @@ def build_teams_html(teams: List[Dict]) -> str:
 """
     return html
 
+
 @app.get("/sessions/{session_date}/teams", response_class=HTMLResponse)
 def show_teams_for_session_date(session_date: str):
     """
@@ -134,9 +134,7 @@ def show_teams_for_session_date(session_date: str):
     This does NOT regenerate teams; it only displays what was saved.
     """
     try:
-        # garante tabs e headers
         sheets_repo.ensure_tabs_and_headers()
-        # função nova que criamos no SheetsRepository
         teams = sheets_repo.get_teams_for_session(session_date)
     except Exception as e:
         return HTMLResponse(
@@ -154,13 +152,11 @@ def show_teams_for_session_date(session_date: str):
     return html
 
 
-
 def push_snapshot_to_github(html: str, date_str: str) -> None:
     """
     Push a static HTML snapshot for the given date to the GitHub Pages repo.
     - date_str: 'YYYY-MM-DD'
     """
-
     gh_token = os.getenv("GH_TOKEN", "").strip()
     gh_repo = os.getenv("GH_REPO", "").strip()
     gh_branch = os.getenv("GH_BRANCH", "main").strip()
@@ -225,7 +221,6 @@ def get_session_rules(session_key: str):
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"Error reading rules: {e}"}, status_code=500)
 
-    # raw_rules já vem em formato estruturado do SheetsRepository
     return {"ok": True, "session_key": session_key, "rules": raw_rules}
 
 
@@ -233,15 +228,18 @@ def get_session_rules(session_key: str):
 def save_session_rules(session_key: str, payload: dict = Body(...)):
     """
     Save a snapshot of soft-control rules for a given session_key.
-    The payload should be:
+
+    Payload:
       {
         "session_key": "...",
         "rules": [
            {
              "player_email": "...",
-             "cannot_play_positions": [...],
+             "cannot_play_positions": [...],   # pode incluir 'keep_pref1'
              "must_play_with": [...],
-             "cannot_play_with": [...]
+             "cannot_play_with": [...],
+             "forced_position": "setter|middle|outside",  # opcional
+             "comment": "..."                             # opcional
            },
            ...
         ]
@@ -263,15 +261,11 @@ def save_session_rules(session_key: str, payload: dict = Body(...)):
 
     try:
         sheets_repo.ensure_tabs_and_headers()
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": f"Sheets error: {e}"}, status_code=500)
-
-    try:
-        normalized = sheets_repo.append_control_rules_snapshot(session_key, rules)
+        sheets_repo.append_control_rules_snapshot(session_key, rules)
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"Error saving rules: {e}"}, status_code=500)
 
-    return {"ok": True, "session_key": session_key, "rules": normalized}
+    return {"ok": True, "session_key": session_key, "rules": rules}
 
 
 # ----------------- Endpoints: CSV + Generate teams ---------------------------
@@ -279,7 +273,8 @@ def save_session_rules(session_key: str, payload: dict = Body(...)):
 @app.post("/upload-csv")
 async def upload_csv(file: UploadFile = File(...)):
     """
-    Step 1: receber CSV e guardar players no STATE, usando CsvParser.
+    Step 1: receber CSV e guardar players no STATE.
+    Além disso: retornar análise de distribuição (times 6/7/5, setters, middles).
     """
     content = await file.read()
     players = csv_parser.parse_players_from_bytes(content)
@@ -287,15 +282,52 @@ async def upload_csv(file: UploadFile = File(...)):
     if not players:
         return JSONResponse({"ok": False, "error": "No players parsed from CSV."}, status_code=422)
 
+    # ===== Análise =====
+    n_players = len(players)
+
+    # 1) Templates previstos
+    T, templates = TemplatePlanner.plan(n_players)
+    num_teams = T
+    num_size7 = sum(1 for t in templates if len(t) == 7)
+    num_size5 = sum(1 for t in templates if len(t) == 5)
+
+    def _n(x: Optional[str]) -> str:
+        return (x or "").strip().lower()
+
+    total_setters = sum(1 for p in players if _n(p.get("pref1")) == "setter")
+    total_middles = sum(1 for p in players if _n(p.get("pref1")) == "middle")
+
+    # cada time de 6 ou 7: 1 setter, 2 middles; time de 5: 1 setter, 1 middle
+    needed_setters = num_teams
+    needed_middles = (num_teams - num_size5) * 2 + num_size5 * 1
+
+    missing_setters = max(0, needed_setters - total_setters)
+    missing_middles = max(0, needed_middles - total_middles)
+
+    analysis = {
+        "num_teams": num_teams,
+        "teams_with_7": num_size7,
+        "teams_with_5": num_size5,
+        "total_setters": total_setters,
+        "needed_setters": needed_setters,
+        "missing_setters": missing_setters,
+        "total_middles": total_middles,
+        "needed_middles": needed_middles,
+        "missing_middles": missing_middles,
+    }
+
+    # ===== Salvar estado =====
     STATE["players"] = players
     STATE["teams"] = []
     STATE["source"] = f"upload:{file.filename}"
     _touch_state()
+
     return {
         "ok": True,
         "source": STATE["source"],
         "total_players": len(players),
         "players": players,
+        "analysis": analysis,
         "updated_at": STATE["updated_at"],
     }
 
@@ -306,7 +338,7 @@ async def generate(payload: Optional[dict] = Body(default=None)):
     Step 2: usar TeamGenerator + SheetsRepository + regras de controle.
     - lê STATE["players"]
     - usa histórico do Sheets para fairness
-    - aplica keep_pref1 na geração (via keep_pref_emails)
+    - aplica keep_pref1 / forced_position na geração
     - aplica pós-processamento (must_play_with / cannot_play_with / cannot_play_positions)
     - salva sessão/assignments no Sheets
     - gera snapshot HTML no GitHub
@@ -341,7 +373,7 @@ async def generate(payload: Optional[dict] = Body(default=None)):
             except Exception:
                 pass
 
-    # ---------- Regras de controle do dia → keep_pref_emails + session_rules ----------
+    # ---------- Regras de controle do dia ----------
     session_key = today.isoformat()
     try:
         session_rules = sheets_repo.get_control_rules_for_session(session_key)
@@ -349,14 +381,22 @@ async def generate(payload: Optional[dict] = Body(default=None)):
         session_rules = []
 
     keep_pref_emails: set[str] = set()
+    forced_pos_by_email: dict[str, str] = {}
+
     for rule in session_rules:
-        email = (rule.get("player_email") or "").strip().lower()
+        email = _norm(rule.get("player_email"))
         if not email:
             continue
-        # critério: se tem alguma posição em cannot_play_positions marcada,
-        # tratamos esse jogador como "protegido" (keep pref1)
+
         cannot_positions = rule.get("cannot_play_positions") or []
-        if cannot_positions:
+        forced_position = _norm(rule.get("forced_position"))
+
+        if forced_position:
+            forced_pos_by_email[email] = forced_position
+
+        # qualquer coisa em cannot_play_positions (incluindo 'keep_pref1')
+        # ou forced_position faz esse jogador ser "protegido"
+        if cannot_positions or forced_position:
             keep_pref_emails.add(email)
 
     # ---------- fairness das duas últimas datas ----------
@@ -365,17 +405,18 @@ async def generate(payload: Optional[dict] = Body(default=None)):
     except Exception:
         last_two_count_map, last_two_any_map = {}, {}
 
-    # ---------- gerar times via TeamGenerator (keep_pref_emails entra aqui) ----------
+    # ---------- gerar times ----------
     generator = TeamGenerator(
         players,
         seed=seed,
         last_two_offpref_count_by_id=last_two_count_map,
         last_two_any_offpref_by_id=last_two_any_map,
         keep_pref_emails=keep_pref_emails,
+        forced_pos_by_email=forced_pos_by_email,
     )
     teams = generator.generate()
 
-    # ---------- pós-processamento de regras (must / cannot play with / cannot positions) ----------
+    # ---------- pós-processamento ----------
     try:
         teams = postprocess_teams(
             teams=teams,
@@ -384,7 +425,6 @@ async def generate(payload: Optional[dict] = Body(default=None)):
             last_two_any_offpref_by_id=last_two_any_map,
         )
     except Exception:
-        # se der erro no pós-processo, seguimos com os times originais
         pass
 
     # ---------- salvar no Sheets ----------
@@ -401,7 +441,6 @@ async def generate(payload: Optional[dict] = Body(default=None)):
             players_by_email=players_by_email,
         )
     except Exception:
-        # não quebra a geração se der erro de escrita
         pass
 
     # ---------- atualizar STATE ----------
@@ -480,11 +519,41 @@ def home():
         cursor: not-allowed;
       }
       .row { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin-bottom:8px; }
+
+      /* METADADOS + STATS */
+      #meta {
+        opacity:.7;
+        margin-top:4px;
+        font-size:14px;
+      }
+      #stats {
+        margin-top:8px;
+        font-size:14px;
+      }
+      .stats-line {
+        margin-bottom:4px;
+      }
+      .stats-label {
+        font-weight:600;
+        margin-right:4px;
+      }
+      .stats-ok {
+        color:#2196f3;
+        font-weight:500;
+      }
+      .stats-warn {
+        color:#e53935;
+        font-weight:500;
+      }
+
       @media (prefers-color-scheme: dark) {
         body { background:#111; color:#eee; }
         button { background:#222; color:#eee; border:1px solid #333; }
         button:hover { background:#333; }
         button.loading { background:#0078d7; color:white; }
+        #meta { opacity:.8; }
+        .stats-ok { color:#42a5f5; }
+        .stats-warn { color:#ef5350; }
       }
     </style>
   </head>
@@ -497,7 +566,9 @@ def home():
       </form>
       <button id="btnGenerate" onclick="generateTeams()" disabled>Generate Teams</button>
     </div>
-    <div id="meta" style="opacity:.7;"></div>
+
+    <div id="meta"></div>
+    <div id="stats"></div>
 
 <script>
 async function uploadCsv(e){
@@ -505,18 +576,86 @@ async function uploadCsv(e){
   const btn = document.getElementById('btnUpload');
   btn.classList.add('loading');
   btn.disabled = true;
+
   const f = document.getElementById('csvFile').files[0];
-  if(!f){ alert('Select a CSV'); btn.classList.remove('loading'); btn.disabled = false; return false; }
+  if(!f){
+    alert('Select a CSV');
+    btn.classList.remove('loading');
+    btn.disabled = false;
+    return false;
+  }
+
   const fd = new FormData();
   fd.append('file', f);
+
   const r = await fetch('/upload-csv', {method:'POST', body: fd});
   const d = await r.json();
-  if(!d.ok){ alert(d.error || 'Upload error'); btn.classList.remove('loading'); btn.disabled = false; return false; }
-  document.getElementById('btnGenerate').disabled = !(d.players && d.players.length);
-  document.getElementById('meta').innerText =
-    `Source: ${d.source||'-'} • Updated: ${d.updated_at||'-'} • Players: ${d.total_players||'-'}`;
+
   btn.classList.remove('loading');
   btn.disabled = false;
+
+  if(!d.ok){
+    alert(d.error || 'Upload error');
+    return false;
+  }
+
+  // habilita Generate
+  document.getElementById('btnGenerate').disabled = !(d.players && d.players.length);
+
+  // Linha de meta básica
+  document.getElementById('meta').innerText =
+    `Source: ${d.source||'-'} • Updated: ${d.updated_at||'-'} • Players: ${d.total_players||'-'}`;
+
+  // ----- BLOCO DE STATS EM LINHAS / COLORIDO -----
+  const statsEl = document.getElementById('stats');
+  const a = d.analysis || {};
+  const lines = [];
+
+  // Times
+  if (a.num_teams != null) {
+    const t5 = a.teams_with_5 || 0;
+    const t7 = a.teams_with_7 || 0;
+    const hasIrregular = (t5 > 0) || (t7 > 0);
+    const cls = hasIrregular ? 'stats-warn' : 'stats-ok';
+
+    let extraParts = [];
+    if (t5 > 0) extraParts.push(`${t5} with 5 players (missing middle)`);
+    if (t7 > 0) extraParts.push(`${t7} with 7 players`);
+
+    let html = `<span class="stats-label">Teams:</span> ` +
+               `<span class="${cls}">${a.num_teams}</span>`;
+    if (extraParts.length) {
+      html += ` <span class="stats-warn">(${extraParts.join(', ')})</span>`;
+    }
+    lines.push(`<div class="stats-line">${html}</div>`);
+  }
+
+  // Setters
+  if (a.needed_setters != null && a.total_setters != null) {
+    const missing = Math.max(0, a.missing_setters || 0);
+    const cls = missing > 0 ? 'stats-warn' : 'stats-ok';
+    let html = `<span class="stats-label">Setters:</span> ` +
+               `<span class="${cls}">${a.total_setters}/${a.needed_setters}</span>`;
+    if (missing > 0) {
+      html += ` <span class="stats-warn">(missing ${missing})</span>`;
+    }
+    lines.push(`<div class="stats-line">${html}</div>`);
+  }
+
+  // Middles
+  if (a.needed_middles != null && a.total_middles != null) {
+    const missing = Math.max(0, a.missing_middles || 0);
+    const cls = missing > 0 ? 'stats-warn' : 'stats-ok';
+    let html = `<span class="stats-label">Middles:</span> ` +
+               `<span class="${cls}">${a.total_middles}/${a.needed_middles}</span>`;
+    if (missing > 0) {
+      html += ` <span class="stats-warn">(missing ${missing})</span>`;
+    }
+    lines.push(`<div class="stats-line">${html}</div>`);
+  }
+
+  statsEl.innerHTML = lines.join('');
+
   return false;
 }
 
@@ -525,10 +664,17 @@ async function generateTeams(){
   btn.classList.add('loading');
   btn.disabled = true;
 
+  // Usa a data local como session_date (alinhado com /control)
+  const today = new Date();
+  const yyyy = today.getFullYear();
+  const mm   = String(today.getMonth() + 1).padStart(2, '0');
+  const dd   = String(today.getDate()).padStart(2, '0');
+  const sessionDate = `${yyyy}-${mm}-${dd}`;
+
   const r = await fetch('/generate-teams', {
     method:'POST',
     headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({})
+    body: JSON.stringify({ session_date: sessionDate })
   });
 
   const d = await r.json();
@@ -541,10 +687,8 @@ async function generateTeams(){
   }
 
   const sessionId = d.session_id || '';
-  const datePart = sessionId.substring(0, 10); // "2025-11-18"
+  const datePart = sessionId.substring(0, 10);
 
-  // Agora abrimos a página servida pelo PRÓPRIO backend,
-  // que lê os times salvos no Google Sheets
   const url = `/sessions/${encodeURIComponent(datePart)}/teams`;
   window.open(url, '_blank');
 }
@@ -552,6 +696,7 @@ async function generateTeams(){
   </body>
 </html>
 """
+
 
 # ----------------- Control page (admin) --------------------
 
@@ -566,7 +711,7 @@ def control_panel():
           - keep_pref1  -> marked internally via cannot_play_positions = ["keep_pref1"]
           - must_play_with
           - cannot_play_with
-    - A list showing current rules for today.
+        * forced_position (optional): setter/middle/outside
     """
     return """
 <!doctype html>
@@ -680,6 +825,20 @@ def control_panel():
       <div class="hint">Used when rule type is "Must play with" or "Cannot play with".</div>
     </div>
 
+    <div class="field">
+      <label for="forcedPosition">Forced position (optional for this player)</label>
+      <select id="forcedPosition">
+        <option value="">No forced position</option>
+        <option value="setter">Setter</option>
+        <option value="middle">Middle</option>
+        <option value="outside">Outside</option>
+      </select>
+      <div class="hint">
+        If you select a forced position, this player will be treated as "must play this position"
+        by the backend logic for this session.
+      </div>
+    </div>
+
     <div class="row" style="margin-top:8px;">
       <button onclick="addRule()">Add / update rule</button>
     </div>
@@ -700,7 +859,7 @@ def control_panel():
 
 <script>
 let sessionKey = "";
-// email -> { player_email, cannot_play_positions[], must_play_with[], cannot_play_with[], keep_pref1: bool }
+// email -> { player_email, cannot_play_positions[], must_play_with[], cannot_play_with[], keep_pref1: bool, forced_position: string }
 let rulesByEmail = {};
 
 function setStatus(msg, isError=false) {
@@ -748,6 +907,9 @@ function refreshRulesList() {
     if (rule.cannot_play_with && rule.cannot_play_with.length) {
       parts.push(`cannot play with: ${rule.cannot_play_with.join(',')}`);
     }
+    if (rule.forced_position) {
+      parts.push(`forced position: ${rule.forced_position}`);
+    }
 
     const text = parts.length ? parts.join(' | ') : '(no constraints)';
     left.innerHTML = `<strong>${email}</strong><br/><span>${text}</span>`;
@@ -772,6 +934,7 @@ function addRule() {
   const emailInput = document.getElementById('playerEmail');
   const typeSelect = document.getElementById('ruleType');
   const otherEmailInput = document.getElementById('otherEmail');
+  const forcedPositionSelect = document.getElementById('forcedPosition');
 
   const email = (emailInput.value || '').trim().toLowerCase();
   if (!email) {
@@ -786,13 +949,13 @@ function addRule() {
       must_play_with: [],
       cannot_play_with: [],
       keep_pref1: false,
+      forced_position: ""
     };
   }
 
   const type = typeSelect.value;
 
   if (type === 'keep_pref1') {
-    // Marcamos como "keep pref1" e usamos cannot_play_positions APENAS como flag
     rulesByEmail[email].keep_pref1 = true;
     rulesByEmail[email].cannot_play_positions = ['keep_pref1'];
   } else if (type === 'must_play_with') {
@@ -814,6 +977,9 @@ function addRule() {
       rulesByEmail[email].cannot_play_with.push(other);
     }
   }
+
+  const forcedPos = (forcedPositionSelect.value || '').trim().toLowerCase();
+  rulesByEmail[email].forced_position = forcedPos;
 
   otherEmailInput.value = '';
   refreshRulesList();
@@ -839,7 +1005,8 @@ async function loadRulesForToday() {
       if (!email) continue;
 
       const cps = r.cannot_play_positions || [];
-      const keepPref1 = Array.isArray(cps) && cps.length > 0; // qualquer valor → flag de keep_pref1
+      const keepPref1 = Array.isArray(cps) && cps.length > 0;
+      const forcedPos = (r.forced_position || '').toLowerCase();
 
       rulesByEmail[email] = {
         player_email: email,
@@ -847,6 +1014,7 @@ async function loadRulesForToday() {
         must_play_with: r.must_play_with || [],
         cannot_play_with: r.cannot_play_with || [],
         keep_pref1: keepPref1,
+        forced_position: forcedPos
       };
     }
 
@@ -869,6 +1037,7 @@ async function saveRules() {
     cannot_play_positions: r.cannot_play_positions || [],
     must_play_with: r.must_play_with || [],
     cannot_play_with: r.cannot_play_with || [],
+    forced_position: r.forced_position || ""
   }));
 
   setStatus('Saving rules...');

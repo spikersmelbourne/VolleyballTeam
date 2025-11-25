@@ -98,15 +98,15 @@ class SheetsRepository:
 
         # normalize existing titles
         titles_raw = [s["properties"]["title"] for s in meta.get("sheets", [])]
-        titles_norm = { (t or "").strip().lower() for t in titles_raw }
+        titles_norm = {(t or "").strip().lower() for t in titles_raw}
 
         want_sessions = (self.sessions_tab or "Sessions").strip()
-        want_assign   = (self.assignments_tab or "Assignments").strip()
-        want_history  = (self.history_tab or "History").strip()
+        want_assign = (self.assignments_tab or "Assignments").strip()
+        want_history = (self.history_tab or "History").strip()
 
         need_sessions = want_sessions.strip().lower() not in titles_norm
-        need_assign   = want_assign.strip().lower()   not in titles_norm
-        need_history  = want_history.strip().lower()  not in titles_norm
+        need_assign = want_assign.strip().lower() not in titles_norm
+        need_history = want_history.strip().lower() not in titles_norm
 
         requests = []
         if need_sessions:
@@ -185,7 +185,7 @@ class SheetsRepository:
         svc = self._sheets_service()
         svc.spreadsheets().values().append(
             spreadsheetId=self.spreadsheet_id,
-            range=f"{self.assignments_tab}!A:G",  # 6 columns
+            range=f"{self.assignments_tab}!A:G",  # 7 columns
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": rows}
@@ -274,7 +274,7 @@ class SheetsRepository:
             if first_sid and len(first_sid) >= 10:
                 last_date = first_sid[:10]
 
-        # If date changed → archive previous day's off-pref rows into History
+                # If date changed → archive previous day's off-pref rows into History
         if last_date and last_date != session_date:
             offpref_rows = [
                 r for r in existing
@@ -282,12 +282,30 @@ class SheetsRepository:
             ]
             if offpref_rows:
                 archived_at = datetime.utcnow().isoformat() + "Z"
+
+                # existing row layout (Assignments):
+                # [session_id, team, name, email, pref1, assigned_pos, out_of_pref1]
                 body = {
                     "values": [
-                        [last_date, r[1], r[2], r[3], r[4], archived_at]
+                        [
+                            last_date,      # date
+                            r[2],           # name
+                            r[3],           # email
+                            r[4],           # pref1
+                            r[5],           # assigned_pos
+                            archived_at     # archived_at
+                        ]
                         for r in offpref_rows
                     ]
                 }
+
+                svc.spreadsheets().values().append(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=f"{self.history_tab}!A:F",
+                    valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body=body,
+                ).execute()
                 svc.spreadsheets().values().append(
                     spreadsheetId=self.spreadsheet_id,
                     range=f"{self.history_tab}!A:F",
@@ -334,27 +352,27 @@ class SheetsRepository:
         # Build assignment rows
         rows = []
         for t in teams:
-             team_number = t.get("team")  # número do time (int)
-             for p in t.get("players", []):
-                 if p.get("is_missing"):
-                     continue
-                 name = p.get("name") or ""
-                 email = (p.get("email") or "").strip().lower()
-                 assigned = (p.get("pos") or "").strip().lower()
-                 pref1 = (players_by_email.get(email) or {}).get("pref1", "")
-                 out_flag = "yes" if (pref1 and assigned and pref1.lower() != assigned.lower()) else "no"
+            team_number = t.get("team")  # número do time (int)
+            for p in t.get("players", []):
+                if p.get("is_missing"):
+                    continue
+                name = p.get("name") or ""
+                email = (p.get("email") or "").strip().lower()
+                assigned = (p.get("pos") or "").strip().lower()
+                pref1 = (players_by_email.get(email) or {}).get("pref1", "")
+                out_flag = "yes" if (pref1 and assigned and pref1.lower() != assigned.lower()) else "no"
 
-                 rows.append(
-                     [
-                          session_id,          # session_id
-                          team_number,         # team
-                          name,                # name
-                          email,               # email
-                          pref1,               # pref1
-                          assigned,            # assigned_pos
-                          out_flag,            # out_of_pref1
-                     ]
-                 )
+                rows.append(
+                    [
+                        session_id,          # session_id
+                        team_number,         # team
+                        name,                # name
+                        email,               # email
+                        pref1,               # pref1
+                        assigned,            # assigned_pos
+                        out_flag,            # out_of_pref1
+                    ]
+                )
 
         self._append_assignments(rows)
 
@@ -472,12 +490,13 @@ class SheetsRepository:
 
         return teams
 
-    # ---------- Control Rules (per session, per player) ----------
+        # ---------- Control Rules (per session, per player) ----------
 
     def _ensure_control_rules_header(self) -> None:
         """
         Garante que a aba ControlRules exista e tenha cabeçalho:
-        session_key | player_email | cannot_play_positions | must_play_with | cannot_play_with | comment
+        session_key | player_email | cannot_play_positions | must_play_with |
+        cannot_play_with | forced_position | comment
         """
         svc = self._sheets_service()
 
@@ -490,15 +509,7 @@ class SheetsRepository:
             try:
                 svc.spreadsheets().batchUpdate(
                     spreadsheetId=self.spreadsheet_id,
-                    body={
-                        "requests": [
-                            {
-                                "addSheet": {
-                                    "properties": {"title": self.control_rules_tab}
-                                }
-                            }
-                        ]
-                    },
+                    body={"requests": [{"addSheet": {"properties": {"title": self.control_rules_tab}}}]}
                 ).execute()
             except Exception as e:
                 msg = str(e).lower()
@@ -506,13 +517,10 @@ class SheetsRepository:
                     raise
 
         # Garante o cabeçalho
-        range_name = f"{self.control_rules_tab}!A1:F1"
-        resp = (
-            svc.spreadsheets()
-            .values()
-            .get(spreadsheetId=self.spreadsheet_id, range=range_name)
-            .execute()
-        )
+        range_name = f"{self.control_rules_tab}!A1:G1"
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=self.spreadsheet_id, range=range_name
+        ).execute()
         values = resp.get("values", [])
 
         expected_header = [
@@ -521,22 +529,20 @@ class SheetsRepository:
             "cannot_play_positions",
             "must_play_with",
             "cannot_play_with",
+            "forced_position",
             "comment",
         ]
 
         if not values:
-            # Não tem nada, escrevemos o cabeçalho
-            body = {"values": [expected_header]}
             svc.spreadsheets().values().update(
                 spreadsheetId=self.spreadsheet_id,
                 range=range_name,
                 valueInputOption="RAW",
-                body=body,
+                body={"values": [expected_header]},
             ).execute()
             return
 
         current_header = values[0]
-        # Se já bate minimamente, não fazemos nada
         if (
             len(current_header) >= 2
             and current_header[0] == "session_key"
@@ -544,53 +550,37 @@ class SheetsRepository:
         ):
             return
 
-        # Se existe algo estranho, sobrescreve com o header esperado
-        body = {"values": [expected_header]}
         svc.spreadsheets().values().update(
             spreadsheetId=self.spreadsheet_id,
             range=range_name,
             valueInputOption="RAW",
-            body=body,
+            body={"values": [expected_header]},
         ).execute()
+
 
     def get_control_rules_for_session(self, session_key: str) -> List[Dict]:
         """
         Read all control rules for a given session_key from the ControlRules tab.
 
-        Returns a list of dicts:
-        {
-            "player_email": str,
-            "cannot_play_positions": List[str],
-            "must_play_with": List[str],
-            "cannot_play_with": List[str],
-        }
-
-        Se houver múltiplas linhas para o mesmo jogador na mesma sessão,
-        a ÚLTIMA linha vence (override), assim podemos "salvar de novo"
-        sem apagar linhas antigas.
+        Returns a list of dicts with:
+        player_email, cannot_play_positions, must_play_with,
+        cannot_play_with, forced_position
         """
         svc = self._sheets_service()
-        # Garante que a aba existe e tenha header
         self._ensure_control_rules_header()
 
-        range_name = f"{self.control_rules_tab}!A2:F"
-        resp = (
-            svc.spreadsheets()
-            .values()
-            .get(spreadsheetId=self.spreadsheet_id, range=range_name)
-            .execute()
-        )
+        range_name = f"{self.control_rules_tab}!A2:G"
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=self.spreadsheet_id, range=range_name
+        ).execute()
         values = resp.get("values", [])
 
         if not values:
             return []
 
-        # A linha 2 em diante já assume que a linha 1 é o header correto
         rules_by_email: Dict[str, Dict] = {}
 
         for row in values:
-            # Esperado:
-            # [session_key, player_email, cannot_play_positions, must_play_with, cannot_play_with, comment]
             if not row or len(row) < 2:
                 continue
 
@@ -605,69 +595,67 @@ class SheetsRepository:
             cannot_positions_raw = row[2] if len(row) > 2 else ""
             must_with_raw = row[3] if len(row) > 3 else ""
             cannot_with_raw = row[4] if len(row) > 4 else ""
+            forced_raw = row[5] if len(row) > 5 else ""
+            comment_raw = row[6] if len(row) > 6 else ""
+
+            cannot_positions = _split_csv_field(cannot_positions_raw)
+            must_with = _split_csv_field(must_with_raw)
+            cannot_with = _split_csv_field(cannot_with_raw)
+
+            # forced_position pode vir da coluna 5 ou da comment
+            forced_position = (forced_raw or comment_raw or "").strip().lower()
 
             rules_by_email[email] = {
                 "player_email": email,
-                "cannot_play_positions": _split_csv_field(cannot_positions_raw),
-                "must_play_with": _split_csv_field(must_with_raw),
-                "cannot_play_with": _split_csv_field(cannot_with_raw),
+                "cannot_play_positions": cannot_positions,
+                "must_play_with": must_with,
+                "cannot_play_with": cannot_with,
+                "forced_position": forced_position,
             }
 
-        # Retorna lista (última linha de cada jogador vence)
         return list(rules_by_email.values())
+
 
     def append_control_rules_snapshot(self, session_key: str, rules: List[Dict]) -> None:
         """
-        Append a snapshot of rules for this session_key.
-
-        Cada item de `rules` deve ter:
-        - player_email: str
-        - cannot_play_positions: List[str]
-        - must_play_with: List[str]
-        - cannot_play_with: List[str]
-
-        Estratégia:
-        - Não apagamos linhas antigas.
-        - Na leitura, a última linha de cada jogador (por session_key) é a que vale.
+        Save a snapshot in the ControlRules tab.
+        The last line for each email/session_key overrides previous ones.
         """
         if not rules:
             return
 
         svc = self._sheets_service()
-        # Garante a aba + cabeçalho
         self._ensure_control_rules_header()
 
         body_values = []
         for r in rules:
-            player_email = (r.get("player_email") or "").strip().lower()
-            if not player_email:
+            email = (r.get("player_email") or "").strip().lower()
+            if not email:
                 continue
 
             cannot_positions = _join_csv_field(r.get("cannot_play_positions", []))
             must_with = _join_csv_field(r.get("must_play_with", []))
             cannot_with = _join_csv_field(r.get("cannot_play_with", []))
+            forced_position = (r.get("forced_position") or "").strip().lower()
+            comment = r.get("comment") or ""
 
-            body_values.append(
-                [
-                    session_key,
-                    player_email,
-                    cannot_positions,
-                    must_with,
-                    cannot_with,
-                    "",  # comment (opcional, deixamos vazio por enquanto)
-                ]
-            )
+            body_values.append([
+                session_key,
+                email,
+                cannot_positions,
+                must_with,
+                cannot_with,
+                forced_position,
+                comment,
+            ])
 
         if not body_values:
             return
 
-        range_name = f"{self.control_rules_tab}!A:F"
-        body = {"values": body_values}
-
         svc.spreadsheets().values().append(
             spreadsheetId=self.spreadsheet_id,
-            range=range_name,
+            range=f"{self.control_rules_tab}!A:G",
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
-            body=body,
+            body={"values": body_values},
         ).execute()

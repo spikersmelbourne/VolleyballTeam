@@ -4,10 +4,12 @@ import random
 
 VALID_POS = {"setter", "middle", "outside"}
 
+
 class HistoryFairness:
     """
     Encapsula a informação de fairness das duas últimas datas.
     """
+
     def __init__(
         self,
         offpref_count_by_id: Optional[Dict[str, int]] = None,
@@ -23,6 +25,7 @@ class HistoryFairness:
     def has_any_offpref(self, email: str) -> bool:
         """Se o jogador já foi off-pref pelo menos uma vez nas duas últimas datas."""
         return self.any_offpref_by_id.get(email, False)
+
 
 class TemplatePlanner:
     """
@@ -41,12 +44,15 @@ class TemplatePlanner:
         r = n_players % 6
         if r == 0:
             T6 = n_players // 6
-            templates = [["setter", "middle", "middle", "outside", "outside", "outside"] for _ in range(T6)]
+            templates = [
+                ["setter", "middle", "middle", "outside", "outside", "outside"]
+                for _ in range(T6)
+            ]
             return T6, templates
 
         if r in (1, 2):
             base = n_players // 6
-            T = base   # mantemos esse comportamento idêntico ao antigo
+            T = base  # mantemos esse comportamento idêntico ao antigo
             templates_7 = [
                 ["setter", "middle", "middle", "outside", "outside", "outside", "outside"]
                 for _ in range(r)
@@ -55,7 +61,7 @@ class TemplatePlanner:
                 ["setter", "middle", "middle", "outside", "outside", "outside"]
                 for _ in range(T - r)
             ]
-            templates = templates_7 + templates_6   # 7 primeiro, depois 6
+            templates = templates_7 + templates_6  # 7 primeiro, depois 6
             return T, templates
 
         # r in (3, 4, 5) → alguns times de 5 (falta 1 middle)
@@ -67,23 +73,35 @@ class TemplatePlanner:
             for _ in range(T - five)
         ]
         templates_5 = [
-            ["setter", "middle", "outside", "outside", "outside"]
-            for _ in range(five)
+            ["setter", "middle", "outside", "outside", "outside"] for _ in range(five)
         ]  # 5: {1S,1M,3O}
         templates = templates_6 + templates_5
         return T, templates
 
+
 class SlotRanker:
     """
     Responsável por decidir o ranking de um jogador para um slot específico.
-    Usa o histórico de fairness via HistoryFairness
-    e a lista de jogadores protegidos (keep pref1).
+    Usa o histórico de fairness via HistoryFairness,
+    a lista de jogadores protegidos (keep pref1)
+    e um mapa de posição forçada (forced_position).
     """
 
-    def __init__(self, history: HistoryFairness, keep_pref_emails: Optional[set[str]] = None):
+    def __init__(
+        self,
+        history: HistoryFairness,
+        keep_pref_emails: Optional[set[str]] = None,
+        forced_pos_by_email: Optional[Dict[str, str]] = None,
+    ):
         self.history = history
-        # conjunto de e-mails protegidos: queremos evitar tirar esses jogadores da pref1
         self.keep_pref_emails = {(e or "").strip().lower() for e in (keep_pref_emails or set())}
+
+        self.forced_pos_by_email: Dict[str, str] = {}
+        for em, pos in (forced_pos_by_email or {}).items():
+            nem = self._norm(em)
+            npos = self._norm(pos)
+            if nem and npos:
+                self.forced_pos_by_email[nem] = npos
 
     @staticmethod
     def _norm(s: Optional[str]) -> str:
@@ -104,15 +122,18 @@ class SlotRanker:
         p2 = self._norm(player.get("pref2"))
         p3 = self._norm(player.get("pref3"))
 
-        # Jogador "protegido": marcado na página de controle
-        # (via regra de cannot_play_positions → interpretada como keep pref1)
-        protected = (email in self.keep_pref_emails) and (p1 in VALID_POS)
+        # posição forçada (se existir) + "pref1 principal"
+        forced_pos = self.forced_pos_by_email.get(email)
+        main_pref1 = forced_pos or p1
 
-        # Regra principal do keep pref1:
-        # se é protegido, NÃO usar esse jogador fora da pref1
-        # na fase normal (relaxed=False). Só considerar fora da pref1
-        # em modo relaxado, quando não há mais alternativas.
-        if protected and not relaxed and pos != p1:
+        # Jogador "protegido": queremos evitar tirá-lo do main_pref1
+        protected_main = main_pref1 if main_pref1 in VALID_POS else None
+        protected = (email in self.keep_pref_emails) and (protected_main is not None)
+
+        # Regra principal do keep pref:
+        # se é protegido, NÃO usar esse jogador fora do main_pref1
+        # na fase normal (relaxed=False). Só considerar fora em modo relaxado.
+        if protected and not relaxed and pos != protected_main:
             return None
 
         # Quantas vezes essa pessoa já foi off-pref nas duas últimas datas
@@ -120,54 +141,38 @@ class SlotRanker:
 
         all_setter = (p1, p2, p3) == ("setter", "setter", "setter")
 
-                # ---------- BLOCO ESPECÍFICO PARA MIDDLE ----------
+        # ---------- BLOCO ESPECÍFICO PARA MIDDLE ----------
         if pos == "middle":
-            # 1) F só joga middle se pref1 == "middle"
-            if gender == "f" and p1 != "middle":
+            # 1) F só joga middle se o main_pref1 for middle
+            if gender == "f" and main_pref1 != "middle":
                 return None
 
-            # 2) Se já foi off-pref nas DUAS últimas datas, não sacrificar de novo
+            # 2) Se já foi off-pref nas DUAS últimas datas, não sacrificar de novo (fase normal)
             if not relaxed and off_ct >= 2:
                 return None
 
             # 3) Verdadeiros middles têm prioridade máxima
-            if p1 == "middle":
+            if forced_pos == "middle":
+                pref_rank = 1  # prioridade alta
+                going_off = (p1 != "middle")  # fairness: se CSV não é middle, conta como off
+            elif p1 == "middle":
                 pref_rank = 1
                 going_off = False
             else:
-                # 4) BACKFILL: aqui vamos diferenciar QUEM é mais "voluntário" a ser middle
+                # 4) BACKFILL: diferenciar quem é mais "voluntário" a ser middle
+                going_off = True  # está indo fora da pref1 real (CSV)
 
-                going_off = True  # está indo fora da pref1
-
-                # Queremos uma escala de "vontade" de ser middle:
-                # número MENOR = mais disposto a ser middle
-                # número MAIOR = vai para o final da fila de backfill
-
-                # Caso 4.1 – middle em segunda preferência: ok usar como backfill
-                # exemplos: setter, middle, outside  ou  outside, middle, setter
                 if p2 == "middle":
                     middle_willingness = 2
-
-                # Caso 4.2 – nunca pediu middle em nenhuma preferência
                 elif "middle" not in (p1, p2, p3):
-                    # nunca pediu middle → bem no final da fila
                     middle_willingness = 6
-
-                # Caso 4.3 – middle só em 3ª preferência E as duas primeiras são setter/outside
-                # exemplos: setter, outside, middle  ou  outside, setter, middle
                 elif (p3 == "middle") and (p1 in {"setter", "outside"}) and (p2 in {"setter", "outside"}):
-                    # essa pessoa pediu claramente jogar como setter/outside
-                    # e só aceitou middle como último recurso → final da fila de backfill
                     middle_willingness = 6
-
-                # Caso 4.4 – outros casos "neutros"
                 else:
-                    # Ex.: alguém com combinações mais estranhas onde middle não está tão rejeitado
                     middle_willingness = 4
 
                 pref_rank = middle_willingness
 
-            # 5) Fairness penalty: maior para quem já foi off-pref antes
             fairness_penalty = 0
             if going_off:
                 fairness_penalty += off_ct * 2
@@ -184,23 +189,36 @@ class SlotRanker:
             return None
 
         # Regra de setter: evitar usar quem é "middle" de pref1 como setter,
-        # a menos que setter esteja em pref2.
-        if pos == "setter" and not relaxed and p1 == "middle" and p2 != "setter":
-            return None
+        # a menos que setter esteja em pref2 – exceto se tiver forced_pos = setter.
+        if pos == "setter" and not relaxed and forced_pos != "setter":
+            if p1 == "middle" and p2 != "setter":
+                return None
 
-        # Ranking de preferência (1 = melhor)
-        if pos == "setter" and all_setter:
-            pref_rank = 0
-        elif p1 == pos:
-            pref_rank = 1
-        elif p2 == pos:
-            pref_rank = 2
-        elif p3 == pos:
-            pref_rank = 3
+        # Ranking de preferência (1 = melhor, 0 = forçado)
+        if forced_pos:
+            if pos == forced_pos:
+                pref_rank = 0  # forçado → prioridade máxima
+            elif p1 == pos:
+                pref_rank = 1
+            elif p2 == pos:
+                pref_rank = 2
+            elif p3 == pos:
+                pref_rank = 3
+            else:
+                pref_rank = 5
         else:
-            pref_rank = 5
+            if pos == "setter" and all_setter:
+                pref_rank = 0
+            elif p1 == pos:
+                pref_rank = 1
+            elif p2 == pos:
+                pref_rank = 2
+            elif p3 == pos:
+                pref_rank = 3
+            else:
+                pref_rank = 5
 
-        # Fairness: penaliza quem vai jogar fora de pref1
+        # Fairness: penaliza quem vai jogar fora de *pref1 real* (CSV)
         going_off = (pos != p1)
         fairness_penalty = 0
         if going_off:
@@ -213,33 +231,6 @@ class SlotRanker:
 
         return (pref_rank, fairness_penalty, special_penalty)
 
-class TeamGenerator:
-    def __init__(
-        self,
-        players: List[Dict],
-        *,
-        seed: Optional[int] = None,
-        last_two_offpref_count_by_id: Optional[Dict[str, int]] = None,
-        last_two_any_offpref_by_id: Optional[Dict[str, bool]] = None,
-        keep_pref_emails: Optional[set[str]] = None,
-    ):
-        self.players = players[:]
-        self.seed = seed
-
-        # componentes
-        self.history = HistoryFairness(
-            offpref_count_by_id=last_two_offpref_count_by_id,
-            any_offpref_by_id=last_two_any_offpref_by_id,
-        )
-        self.slot_ranker = SlotRanker(self.history, keep_pref_emails=keep_pref_emails)
-
-        self.teams: List[Dict] = []
-        self.templates: List[List[str]] = []
-
-        if self.seed is not None:
-            random.seed(self.seed)
-        random.shuffle(self.players)
-
 
 class TeamGenerator:
     def __init__(
@@ -250,6 +241,7 @@ class TeamGenerator:
         last_two_offpref_count_by_id: Optional[Dict[str, int]] = None,
         last_two_any_offpref_by_id: Optional[Dict[str, bool]] = None,
         keep_pref_emails: Optional[set[str]] = None,
+        forced_pos_by_email: Optional[Dict[str, str]] = None,
     ):
         self.players = players[:]
         self.seed = seed
@@ -259,7 +251,11 @@ class TeamGenerator:
             offpref_count_by_id=last_two_offpref_count_by_id,
             any_offpref_by_id=last_two_any_offpref_by_id,
         )
-        self.slot_ranker = SlotRanker(self.history, keep_pref_emails=keep_pref_emails)
+        self.slot_ranker = SlotRanker(
+            self.history,
+            keep_pref_emails=keep_pref_emails,
+            forced_pos_by_email=forced_pos_by_email,
+        )
 
         self.teams: List[Dict] = []
         self.templates: List[List[str]] = []
@@ -300,14 +296,16 @@ class TeamGenerator:
                 "middle": 2 if size in (6, 7) else 1,
                 "outside": 4 if size == 7 else 3,
             }
-            teams.append({
-                "team": i + 1,
-                "size": size,
-                "missing": None,
-                "extra_player_index": None,
-                "players": [],
-                "meta": meta,
-            })
+            teams.append(
+                {
+                    "team": i + 1,
+                    "size": size,
+                    "missing": None,
+                    "extra_player_index": None,
+                    "players": [],
+                    "meta": meta,
+                }
+            )
 
         total_f = self._total_f(self.players)
         remaining = self.players[:]
@@ -328,7 +326,8 @@ class TeamGenerator:
                 ranked: List[Tuple[Tuple[int, int, int], Dict]] = []
                 for p in remaining:
                     r = self.slot_ranker.rank_for_slot(
-                        p, pos,
+                        p,
+                        pos,
                         team_has_f_already=self._team_has_f(team),
                         distributed_f=distributed_f,
                         relaxed=False,
@@ -339,7 +338,8 @@ class TeamGenerator:
                 if not ranked:
                     for p in remaining:
                         r = self.slot_ranker.rank_for_slot(
-                            p, pos,
+                            p,
+                            pos,
                             team_has_f_already=self._team_has_f(team),
                             distributed_f=distributed_f,
                             relaxed=True,
@@ -353,12 +353,14 @@ class TeamGenerator:
                 ranked.sort(key=lambda t: (t[0][0], t[0][1], t[0][2], random.random()))
                 pick = ranked[0][1]
 
-                team["players"].append({
-                    "name": pick.get("name", ""),
-                    "pos": pos,
-                    "gender": self._norm(pick.get("gender")),
-                    "email": pick.get("email", ""),
-                })
+                team["players"].append(
+                    {
+                        "name": pick.get("name", ""),
+                        "pos": pos,
+                        "gender": self._norm(pick.get("gender")),
+                        "email": pick.get("email", ""),
+                    }
+                )
                 remaining.remove(pick)
 
             if team["size"] == 7 and team["players"]:
@@ -367,23 +369,29 @@ class TeamGenerator:
             if team["size"] in (6, 7) and team.get("missing") is None:
                 team["missing"] = None
 
+        # Se sobrar alguém (por segurança), distribui como outside
         while remaining:
             idx = min(
                 range(T_count),
-                key=lambda i: len([pl for pl in teams[i]["players"] if not pl.get("is_missing")])
+                key=lambda i: len(
+                    [pl for pl in teams[i]["players"] if not pl.get("is_missing")]
+                ),
             )
             p = remaining.pop(0)
-            teams[idx]["players"].append({
-                "name": p.get("name", ""),
-                "pos": "outside",
-                "gender": self._norm(p.get("gender")),
-                "email": p.get("email", ""),
-            })
+            teams[idx]["players"].append(
+                {
+                    "name": p.get("name", ""),
+                    "pos": "outside",
+                    "gender": self._norm(p.get("gender")),
+                    "email": p.get("email", ""),
+                }
+            )
             if teams[idx]["size"] == 7:
                 teams[idx]["extra_player_index"] = len(teams[idx]["players"]) - 1
 
         self.teams = teams
         return teams
+
 
 def generate_teams(
     players: List[Dict],
@@ -392,6 +400,7 @@ def generate_teams(
     last_two_offpref_count_by_id: Optional[Dict[str, int]] = None,
     last_two_any_offpref_by_id: Optional[Dict[str, bool]] = None,
     keep_pref_emails: Optional[set[str]] = None,
+    forced_pos_by_email: Optional[Dict[str, str]] = None,
 ) -> List[Dict]:
     generator = TeamGenerator(
         players,
@@ -399,8 +408,10 @@ def generate_teams(
         last_two_offpref_count_by_id=last_two_offpref_count_by_id,
         last_two_any_offpref_by_id=last_two_any_offpref_by_id,
         keep_pref_emails=keep_pref_emails,
+        forced_pos_by_email=forced_pos_by_email,
     )
     return generator.generate()
+
 
 def _norm_email(s: Optional[str]) -> str:
     return (s or "").strip().lower()
@@ -422,9 +433,12 @@ def postprocess_teams(
         "cannot_play_positions": ["middle", ...],
         "must_play_with": ["b@x.com", ...],
         "cannot_play_with": ["c@x.com", ...],
+        "forced_position": "setter" | "middle" | "outside" | ""
       }
 
     Comportamento (best-effort):
+      0) forced_position: tenta colocar o jogador em algum slot daquela posição
+         (preferindo swap de jogadores para não quebrar o template).
       1) Tenta corrigir cannot_play_positions com trocas de posição dentro do mesmo time.
       2) Tenta atender must_play_with trocando jogadores entre times (mesma posição).
       3) Tenta separar cannot_play_with trocando jogadores entre times (mesma posição).
@@ -450,23 +464,32 @@ def postprocess_teams(
                 "cannot_play_positions": set(),
                 "must_play_with": set(),
                 "cannot_play_with": set(),
+                "forced_position": "",
             },
         )
 
+        # cannot_play_positions (apenas valores válidos)
         for pos in r.get("cannot_play_positions") or []:
             p = (pos or "").strip().lower()
             if p in VALID_POS:
                 entry["cannot_play_positions"].add(p)
 
+        # must_play_with
         for em in r.get("must_play_with") or []:
             e2 = _norm_email(em)
             if e2:
                 entry["must_play_with"].add(e2)
 
+        # cannot_play_with
         for em in r.get("cannot_play_with") or []:
             e2 = _norm_email(em)
             if e2:
                 entry["cannot_play_with"].add(e2)
+
+        # forced_position
+        fp_raw = (r.get("forced_position") or "").strip().lower()
+        if fp_raw in VALID_POS:
+            entry["forced_position"] = fp_raw
 
     # Se não há regras, nada a fazer.
     if not rules_by_email:
@@ -487,6 +510,65 @@ def postprocess_teams(
     email_index = build_index()
 
     # ===============================================================
+    # 0) forced_position → tentar colocar jogador em slot daquela posição
+    # ===============================================================
+    for email, rule in rules_by_email.items():
+        forced_pos = rule.get("forced_position") or ""
+        if not forced_pos:
+            continue
+
+        loc = email_index.get(email)
+        if not loc:
+            continue  # jogador não está em nenhum time
+
+        ti, pi = loc
+        player = teams[ti]["players"][pi]
+        current_pos = (player.get("pos") or "").strip().lower()
+        if current_pos == forced_pos:
+            continue  # já está na posição forçada
+
+        # Tentar achar algum slot de forced_pos em qualquer time
+        # para fazer swap de jogadores (mantendo o template).
+        best_candidate = None  # (offpref, ti2, pj2)
+        for ti2, team2 in enumerate(teams):
+            for pj2, p2 in enumerate(team2.get("players", [])):
+                if p2.get("is_missing"):
+                    continue
+                pos2 = (p2.get("pos") or "").strip().lower()
+                if pos2 != forced_pos:
+                    continue
+
+                email2 = _norm_email(p2.get("email"))
+                rule2 = rules_by_email.get(email2)
+                # se o outro jogador também tem forced_position diferente do pos atual,
+                # não podemos tirá-lo desse slot.
+                if rule2:
+                    fp2 = rule2.get("forced_position") or ""
+                    if fp2 and fp2 != pos2:
+                        continue
+
+                # também evitar jogar o outro em uma posição proibida para ele
+                if rule2 and current_pos in rule2["cannot_play_positions"]:
+                    continue
+
+                off2 = offpref_count.get(email2, 0)
+                if (best_candidate is None) or (off2 < best_candidate[0]):
+                    best_candidate = (off2, ti2, pj2)
+
+        if best_candidate is not None:
+            _, ti2, pj2 = best_candidate
+            # swap de jogadores entre slots (posições permanecem as mesmas)
+            teams[ti][pi], teams[ti2][pj2] = teams[ti2][pj2], teams[ti][pi]
+            email_index = build_index()  # reindexa após swap
+        else:
+            # fallback: força a posição diretamente (quebra um pouco o template, mas garante a regra)
+            player["pos"] = forced_pos
+            # índice ainda continua apontando para o mesmo slot
+
+    # Recria índice após ajustes de forced_position
+    email_index = build_index()
+
+    # ===============================================================
     # 1) cannot_play_positions → trocas de posição dentro do time
     # ===============================================================
     for email, rule in rules_by_email.items():
@@ -494,9 +576,13 @@ def postprocess_teams(
         if not forbidden:
             continue
 
+        # se esse jogador tem forced_position, não mexemos mais na posição dele aqui
+        if rule.get("forced_position"):
+            continue
+
         loc = email_index.get(email)
         if not loc:
-            continue  # jogador não está em nenhum time (não achou no CSV ou não foi escalado)
+            continue  # jogador não está em nenhum time
 
         ti, pi = loc
         player = teams[ti]["players"][pi]
@@ -507,6 +593,7 @@ def postprocess_teams(
         # Vamos tentar trocar de posição com alguém do MESMO time:
         #   - que tenha outra posição
         #   - que não tenha o current_pos proibido
+        #   - que não tenha forced_position (para não quebrar outras regras)
         #   - preferindo quem tem histórico de off-pref menor
         #   - se a posição for "middle", tentar evitar colocar F em middle se houver alternativa
         candidates = []
@@ -523,13 +610,17 @@ def postprocess_teams(
 
             c_email = _norm_email(cp.get("email"))
             c_rule = rules_by_email.get(c_email)
+
+            # não mexer com jogadores que tenham forced_position
+            if c_rule and c_rule.get("forced_position"):
+                continue
+
             if c_rule and current_pos in c_rule["cannot_play_positions"]:
                 # o colega também não pode jogar nessa posição
                 continue
 
             # Fairness: evitar quem já foi muito sacrificado
             c_off = offpref_count.get(c_email, 0)
-
             c_gender = (cp.get("gender") or "").strip().lower()
             candidates.append((cj, c_off, c_gender, other_pos))
 
