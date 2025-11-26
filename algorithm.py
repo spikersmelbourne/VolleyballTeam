@@ -122,28 +122,22 @@ class SlotRanker:
         p2 = self._norm(player.get("pref2"))
         p3 = self._norm(player.get("pref3"))
 
-        # posição forçada (se existir) + "pref1 principal"
         forced_pos = self.forced_pos_by_email.get(email)
         main_pref1 = forced_pos or p1
 
-        # Jogador "protegido": queremos evitar tirá-lo do main_pref1
         protected_main = main_pref1 if main_pref1 in VALID_POS else None
         protected = (email in self.keep_pref_emails) and (protected_main is not None)
 
-        # Regra principal do keep pref:
-        # se é protegido, NÃO usar esse jogador fora do main_pref1
-        # na fase normal (relaxed=False). Só considerar fora em modo relaxado.
+        # Jogador protegido: na fase normal não sai da posição principal/forçada
         if protected and not relaxed and pos != protected_main:
             return None
 
-        # Quantas vezes essa pessoa já foi off-pref nas duas últimas datas
         off_ct = self.history.offpref_count(email)
-
         all_setter = (p1, p2, p3) == ("setter", "setter", "setter")
 
         # ---------- BLOCO ESPECÍFICO PARA MIDDLE ----------
         if pos == "middle":
-            # 1) F só joga middle se o main_pref1 for middle
+            # 1) F só joga middle se o main_pref1 for middle (continua igual)
             if gender == "f" and main_pref1 != "middle":
                 return None
 
@@ -151,28 +145,46 @@ class SlotRanker:
             if not relaxed and off_ct >= 2:
                 return None
 
-            # 3) Verdadeiros middles têm prioridade máxima
+            # 3) Verdadeiros middles continuam com prioridade máxima
             if forced_pos == "middle":
-                pref_rank = 1  # prioridade alta
-                going_off = (p1 != "middle")  # fairness: se CSV não é middle, conta como off
+                pref_rank = 1
+                going_off = (p1 != "middle")
             elif p1 == "middle":
                 pref_rank = 1
                 going_off = False
             else:
-                # 4) BACKFILL: diferenciar quem é mais "voluntário" a ser middle
-                going_off = True  # está indo fora da pref1 real (CSV)
+                # =============== BACKFILL DE MIDDLE ===============
+                # Aqui entram jogadores que NÃO são middle de pref1
+                # Regras de exclusão (fase normal):
+                # - não usar setter raiz (p1=setter e p2 != middle)
+                # - não usar quem colocou setter como pref2
+                # - não usar quem foi off-pref recentemente
+                going_off = True
 
-                if p2 == "middle":
-                    middle_willingness = 2
-                elif "middle" not in (p1, p2, p3):
-                    middle_willingness = 6
-                elif (p3 == "middle") and (p1 in {"setter", "outside"}) and (p2 in {"setter", "outside"}):
-                    middle_willingness = 6
-                else:
-                    middle_willingness = 4
+                if not relaxed:
+                    # proteger setters "puros" para continuarem como setter
+                    if p1 == "setter" and p2 != "middle":
+                        return None
 
-                pref_rank = middle_willingness
+                    # não puxar quem colocou setter como pref2 (reservar como setter secundário)
+                    if p2 == "setter":
+                        return None
 
+                    # evitar quem já foi off-pref pelo menos uma vez recentemente
+                    if self.history.has_any_offpref(email):
+                        return None
+
+                # Se chegou aqui, o jogador é um candidato válido de backfill
+                # Todos os candidatos de backfill recebem a MESMA prioridade.
+                pref_rank = 4  # valor fixo para todo mundo
+
+                # Fairness dentro do grupo de backfill:
+                # para dar MESMA chance, não diferenciamos por penalidade.
+                fairness_penalty = 0
+                special_penalty = 0
+                return (pref_rank, fairness_penalty, special_penalty)
+
+            # Para quem é middle de verdade (forced/pref1), mantemos a lógica antiga de fairness
             fairness_penalty = 0
             if going_off:
                 fairness_penalty += off_ct * 2
@@ -197,7 +209,7 @@ class SlotRanker:
         # Ranking de preferência (1 = melhor, 0 = forçado)
         if forced_pos:
             if pos == forced_pos:
-                pref_rank = 0  # forçado → prioridade máxima
+                pref_rank = 0
             elif p1 == pos:
                 pref_rank = 1
             elif p2 == pos:
@@ -218,7 +230,6 @@ class SlotRanker:
             else:
                 pref_rank = 5
 
-        # Fairness: penaliza quem vai jogar fora de *pref1 real* (CSV)
         going_off = (pos != p1)
         fairness_penalty = 0
         if going_off:
@@ -226,11 +237,9 @@ class SlotRanker:
             if not relaxed and off_ct >= 1:
                 fairness_penalty += 3
 
-        # Penalidade leve para conversão middle → setter (quando permitido)
         special_penalty = 1 if (pos == "setter" and p1 == "middle" and p2 == "setter") else 0
 
         return (pref_rank, fairness_penalty, special_penalty)
-
 
 class TeamGenerator:
     def __init__(
